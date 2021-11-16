@@ -1,6 +1,6 @@
 
-from lxml import etree
 import six
+from lxml import etree
 
 from bitcdp import exception
 from bitcdp import utils

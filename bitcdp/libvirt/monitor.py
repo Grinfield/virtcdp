@@ -1,18 +1,15 @@
 
+from collections import namedtuple
 import json
 import logging
-import six
 
 import libvirt
 import libvirt_qemu
 from libvirt_qemu import qemuMonitorCommand
-from eventlet import patcher
 
 from bitcdp import exception
-from bitcdp.libvirt import event as virtevent
 
 LOG = logging.getLogger(__name__)
-native_Queue = patcher.original("Queue" if six.PY2 else "queue")
 
 
 class QMPCmd(object):
@@ -31,15 +28,21 @@ class QMPCmd(object):
 
 
 class QemuMonitor(object):
-    def __init__(self):
-        event_q = None
+    """
+    Send an arbitrary command to domain via Libvirt method `qemuMonitorCommand`
+    through Qemu Monitor Protocol.
+    """
 
-    def sendCommand(self, dom, cmd, cmdid=None, *args, **kwargs):
-        LOG.debug("->>> domain '%s' command '%s'.", dom.UUIDString, cmd)
+    def __init__(self, domain):
+        self._domain = domain
+        self._conn = None
+
+    def qmp_cmd(self, cmd, cmdid=None, **kwargs):
+        LOG.debug("->>> domain '%s' command '%s'.", self._domain.UUIDString(), cmd)
         LOG.debug("->>> args: %s", kwargs)
 
         try:
-            result = qemuMonitorCommand(dom,
+            result = qemuMonitorCommand(self._domain,
                                         QMPCmd.makecmd(cmd, cmdid, **kwargs),
                                         flags=libvirt_qemu.VIR_DOMAIN_QEMU_MONITOR_COMMAND_DEFAULT)
             print "<<<- Get result: %s." % result
@@ -49,79 +52,163 @@ class QemuMonitor(object):
                 result = json.loads(result)
 
             if "error" in result:
-                LOG.error("<<<- Qemu monitor command failure: class %(class)s, %(desc)s.",
+                LOG.error("<<<- Qemu monitor command failure, class: %(class)s,"
+                          " desc: %(desc)s.",
                           {"class": result["error"]["class"],
                            "desc": result["error"]["desc"]})
                 raise exception.QemuMonitorCommandError(
                     cmd=cmd,
-                    domain=dom.UUIDString,
+                    domain=self._domain.UUIDString(),
                     args=kwargs,
-                    desc=(result['error']['desc'])
+                    cls=result["error"]["class"],
+                    desc=result['error']['desc']
                 )
 
         except libvirt.libvirtError as e:
             LOG.exception("Libvirt error occurred via QMP, "
                           "domain: %(dom)s, command: %(cmd)s, args: %(args)s",
-                          {"dom": dom.UUIDString, "cmd": cmd, "args": kwargs})
+                          {"dom": self._domain.UUIDString(), "cmd": cmd, "args": kwargs})
             raise e
         except Exception as e:
             raise e
 
         return result['return']
 
-    def transaction_command(self):
-        pass
+    @staticmethod
+    def transaction_action(action, **kwargs):
+        return {
+            'type': action,
+            'data': dict((k.replace('_', '-'), v) for k, v in kwargs.iteritems())
+        }
 
-    def register_qemu_monitor_event(self, dom=None, event_q=None):
-        opaque = event_q
-        conn = dom.connect()
-        try:
-            LOG.info("Registering for qemu monitor events: %s for domain %s",
-                     self, dom.UUIDString())
-            id = libvirt_qemu.qemuMonitorEventRegister(
-                conn,
-                dom,
-                None,
-                self._qemu_monitor_event_callback,
-                opaque
-            )
-        except Exception as e:
-            LOG.warning("URI %(uri)s does not support connection"
-                        " events: %(error)s",
-                        {'uri': self._uri, 'error': e})
+    def transaction_bitmap_clear(self, node, name, **kwargs):
+        """Return transaction action object for bitmap clear """
+        return self.transaction_action('block-dirty-bitmap-clear',
+                                       node=node,
+                                       name=name,
+                                       **kwargs)
 
-        return id
+    def transaction_bitmap_add(self, node, name, **kwargs):
+        """Return transaction action object for bitmap add """
+        return self.transaction_action('block-dirty-bitmap-add',
+                                       node=node,
+                                       name=name,
+                                       **kwargs)
 
-    def _qemu_monitor_event_callback(self, conn, dom, event,
-                                     seconds, micros, details,
-                                     opaque):
-        qemu_mon_q = opaque
-        if qemu_mon_q is None:
-            return
+    def full_backup_with_bitmap(self, dev, target, format="qcow2", sync="full"):
+        actions = []
+        bitmap = "bitcdp-%s" % dev.node
+        if dev.has_bitmap:
+            actions.append(self.transaction_bitmap_clear(dev.node, bitmap))
+        else:
+            actions.append(self.transaction_bitmap_add(dev.node, bitmap))
 
-        uuid = dom.UUIDString()
-        job_status = event
-        # if event == libvirt.VIR_DOMAIN_JOB_COMPLETED:
-        #     job_status = libvirt.VIR_DOMAIN_JOB_COMPLETED
+        actions.append(self.transaction_action("drive-backup",
+                                               device=dev.node,
+                                               target=target,
+                                               format=format,
+                                               sync=sync))
+        # actions.append(self.transaction_bitmap_clear(dev, dev.bitmap))
 
-        # if job_status is not None:
-        #     qm_event = virtevent.QemuMonitorEvent(uuid, job_status, seconds)
-        #     qemu_monitor_queue.put(qm_event)
+        reply = self.qmp_cmd("transaction", actions=actions)
 
-        qm_event = virtevent.QemuMonitorEvent(uuid, job_status, seconds, details)
-        qemu_mon_q.put(qm_event)
-        # LOG.debug("qemu_monitor_event_callback Queue: %s, EVENT: "
-        #           "Domain %s(%s) %s, DETAILS:%s" %
-        #           (opaque, dom.name(), dom.ID(), qm_event.get_status(),
-        #            qm_event.get_details()))
+        return reply
 
-    def deregister_qemu_monitor_event(self, domain, callback_id):
-        conn = domain.connect()
-        try:
-            LOG.info("Deregistering for qemu monitor events callback: %s",
-                     callback_id)
-            libvirt_qemu.qemuMonitorEventDeregister(conn, callback_id)
-        except Exception as ex:
-            LOG.exception("Failed to deregister qemu monitor event "
-                          "callback id %(id)s, error: %(error)s",
-                          {'id': callback_id, 'error': ex})
+    def inc_backup(self, dev, target, format="qcow2", sync="incremental"):
+        bitmap = "bitcdp-%s" % dev.node
+        if not dev.has_bitmap:
+            raise exception.IncBackupNoBitmapException(
+                dev=dev.node,
+                uuid=self._domain.UUIDString())
+
+        kwargs = {"device": dev.node,
+                  "target": target,
+                  "format": format,
+                  "bitmap": bitmap,
+                  "sync": sync}
+        reply = self.qmp_cmd("drive-backup", **kwargs)
+
+        return reply
+
+    def query_block(self):
+        blockdevs = self._query_block()
+        if not blockdevs:
+            LOG.error("Instance %(instance_id)s has no any block device suitable for backup.",
+                      {"instance_id": self._domain.UUIDString()})
+            raise exception.NoBlockdevsFound(instance_id=self._domain.UUIDString())
+
+        for dev in blockdevs:
+            if dev.has_bitmap is True:
+                state = self._check_bitmap_state(dev.node, dev.bitmaps)
+                if state is not True:
+                    LOG.warn("Bitmap for device %(device)s is in state %(state)s.",
+                             {"device": dev.node,
+                              "state": state})
+        return blockdevs
+
+    def _query_block(self):
+        ret = self.qmp_cmd("query-block")
+        return self._get_block_devices(ret)
+
+    @staticmethod
+    def _check_bitmap_state(node, bitmaps):
+        """
+        Check if the bitmap state is ready for backup
+            active  -> Ready for backup
+            frozen  -> backup in progress
+            disabled-> migration might be going on
+        """
+        for bitmap in bitmaps:
+            LOG.debug('Node %s, Bitmap: %s', node, bitmap)
+            match = "%s-%s" % ('bitcdp', node)
+            if bitmap["name"] == match and bitmap['status'] == "active":
+                return True
+
+    @staticmethod
+    def _get_block_devices(blockinfo):
+        """Get a list of block devices that we can create a bitmap for,
+           currently we only get inserted qcow based images
+        """
+        BlockDev = namedtuple('BlockDev', [
+            'node', 'format', 'filename', 'backing_image', 'has_bitmap', 'bitmaps'
+        ])
+        blockdevs = []
+
+        for device in blockinfo:
+            backing_image = False
+            has_bitmap = False
+            bitmaps = None
+
+            try:
+                inserted = device['inserted']
+                # if inserted['drv'] == 'raw':
+                #     continue
+
+                try:
+                    if len(device['dirty-bitmaps']) > 0:
+                        has_bitmap = True
+                        bitmaps = device['dirty-bitmaps']
+                except KeyError:
+                    pass
+
+                try:
+                    bi = inserted['image']['backing-image']
+                    backing_image = True
+                except KeyError:
+                    pass
+
+                blockdevs.append(BlockDev(
+                    device['device'],
+                    inserted['image']['format'],
+                    inserted['image']['filename'],
+                    backing_image,
+                    has_bitmap,
+                    bitmaps)
+                )
+            except KeyError:
+                continue
+
+        if len(blockdevs) == 0:
+            return None
+
+        return blockdevs

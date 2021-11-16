@@ -2,73 +2,42 @@ import logging
 import operator
 import os
 import socket
-import sys
-import threading
 import six
 
 import libvirt
-import libvirt_qemu
 from eventlet import greenio
 from eventlet import greenthread
 from eventlet import patcher
-from eventlet import tpool
 
-from bitcdp import exception
 from bitcdp import utils
-from bitcdp import config
 from bitcdp.libvirt import event as virtevent
+from bitcdp.libvirt import connection
 
 LOG = logging.getLogger(__name__)
 
 native_socket = patcher.original('socket')
-native_threading = patcher.original("threading")
 native_Queue = patcher.original("Queue" if six.PY2 else "queue")
-
-CONF = config.CONF
 
 # This list is for libvirt hypervisor drivers that need special handling.
 # This is *not* the complete list of supported hypervisor drivers.
 HV_DRIVER_QEMU = "QEMU"
-HV_DRIVER_XEN = "Xen"
 
 
 class Host(object):
 
-    def __init__(self, uri, read_only=False,
-                 conn_event_handler=None,
+    def __init__(self, conn_event_handler=None,
                  lifecycle_event_handler=None):
-
-        self._uri = uri
-        self._read_only = read_only
         self._initial_connection = True
         self._conn_event_handler = conn_event_handler
         self._conn_event_handler_queue = six.moves.queue.Queue()
         self._lifecycle_event_handler = lifecycle_event_handler
         self._caps = None
         self._hostname = None
-
         self._wrapped_conn = None
-        self._wrapped_conn_lock = threading.Lock()
-        self._event_queue = None
 
+        self._event_queue = None
         self._events_delayed = {}
         self._lifecycle_delay = 15
-
-    def _native_thread(self):
-        """Receives async events coming in from libvirtd.
-
-        This is a native thread which runs the default
-        libvirt event loop implementation. This processes
-        any incoming async events from libvirtd and queues
-        them for later dispatch. This thread is only
-        permitted to use libvirt python APIs, and the
-        driver.queue_event method. In particular any use
-        of logging is forbidden, since it will confuse
-        eventlet's greenthread integration
-        """
-
-        while True:
-            libvirt.virEventRunDefaultImpl()
 
     def _dispatch_thread(self):
         """Dispatches async events coming in from libvirtd.
@@ -83,17 +52,19 @@ class Host(object):
 
     def _conn_event_thread(self):
         """Dispatches async connection events"""
-        # NOTE(mdbooth): This thread doesn't need to jump through the same
+        # This thread doesn't need to jump through the same
         # hoops as _dispatch_thread because it doesn't interact directly
         # with the libvirt native thread.
+
         while True:
             self._dispatch_conn_event()
 
     def _dispatch_conn_event(self):
-        # NOTE(mdbooth): Splitting out this loop looks redundant, but it
+        # Splitting out this loop looks redundant, but it
         # means we can easily dispatch events synchronously from tests and
         # it isn't completely awful.
         handler = self._conn_event_handler_queue.get()
+
         try:
             handler()
         except Exception:
@@ -124,58 +95,15 @@ class Host(object):
             transition = virtevent.EVENT_LIFECYCLE_RESUMED
 
         if transition is not None:
-            event_compat = virtevent.LifecycleEvent(uuid, transition)
-            self._queue_event(event_compat)
+            event_compact = virtevent.LifecycleEvent(uuid, transition)
+            self._queue_event(event_compact)
 
             LOG.debug("myDomainEventCallback%s EVENT: Domain %s(%s) %s" % (
-                opaque, dom.name(), dom.ID(), event_compat.get_name()))
+                opaque, dom.name(), dom.ID(), event_compact.get_name()))
 
     def _close_callback(self, conn, reason, opaque):
         close_info = {'conn': conn, 'reason': reason}
         self._queue_event(close_info)
-
-    @staticmethod
-    def _test_connection(conn):
-        try:
-            conn.getLibVersion()
-            return True
-        except libvirt.libvirtError as e:
-            if (e.get_error_code() in (libvirt.VIR_ERR_SYSTEM_ERROR,
-                                       libvirt.VIR_ERR_INTERNAL_ERROR) and
-                    e.get_error_domain() in (libvirt.VIR_FROM_REMOTE,
-                                             libvirt.VIR_FROM_RPC)):
-                LOG.debug('Connection to libvirt broke')
-                return False
-            raise
-
-    @staticmethod
-    def _connect_auth_cb(creds, opaque):
-        if len(creds) == 0:
-            return 0
-        raise exception.InternalError(
-            "Can not handle authentication request for %d credentials"
-            % len(creds))
-
-    @staticmethod
-    def _connect(uri, read_only):
-        auth = [[libvirt.VIR_CRED_AUTHNAME,
-                 libvirt.VIR_CRED_ECHOPROMPT,
-                 libvirt.VIR_CRED_REALM,
-                 libvirt.VIR_CRED_PASSPHRASE,
-                 libvirt.VIR_CRED_NOECHOPROMPT,
-                 libvirt.VIR_CRED_EXTERNAL],
-                Host._connect_auth_cb,
-                None]
-
-        flags = 0
-        if read_only:
-            flags = libvirt.VIR_CONNECT_RO
-        # tpool.proxy_call creates a native thread. Due to limitations
-        # with eventlet locking we cannot use the logging API inside
-        # the called function.
-        return tpool.proxy_call(
-            (libvirt.virDomain, libvirt.virConnect),
-            libvirt.openAuth, uri, auth, flags)
 
     def _queue_event(self, event):
         """Puts an event on the queue for dispatch.
@@ -227,15 +155,10 @@ class Host(object):
                 pass
         if last_close_event is None:
             return
+
         conn = last_close_event['conn']
-        # get_new_connection may already have disabled the host,
-        # in which case _wrapped_conn is None.
-        with self._wrapped_conn_lock:
-            if conn == self._wrapped_conn:
-                reason = str(last_close_event['reason'])
-                msg = "Connection to libvirt lost: %s" % reason
-                self._wrapped_conn = None
-                self._queue_conn_event_handler(False, msg)
+        self._wrapped_conn.dispatch_conn_closed_event(conn,
+                                                      last_close_event)
 
     def _event_emit_delayed(self, event):
         """Emit events - possibly delayed."""
@@ -299,136 +222,29 @@ class Host(object):
         libvirt event loop integration. This forwards events
         to a green thread which does the actual dispatching.
         """
-
         self._init_events_pipe()
-
-        LOG.debug("Starting native event thread")
-        self._event_thread = native_threading.Thread(
-            target=self._native_thread)
-        self._event_thread.setDaemon(True)
-        self._event_thread.start()
 
         LOG.debug("Starting green dispatch thread")
         utils.spawn(self._dispatch_thread)
-        # self._disp_thread = threading.Thread(
-        #     target=self._dispatch_thread)
-        # self._disp_thread.start()
 
-    def _get_new_connection(self):
-        # call with _wrapped_conn_lock held
-        LOG.debug('Connecting to libvirt: %s', self._uri)
-
-        # This will raise an exception on failure
-        wrapped_conn = self._connect(self._uri, self._read_only)
-
-        try:
-            LOG.debug("Registering for lifecycle events %s", self)
-            wrapped_conn.domainEventRegisterAny(
-                None,
-                libvirt.VIR_DOMAIN_EVENT_ID_LIFECYCLE,
-                self._event_lifecycle_callback,
-                self)
-        except Exception as e:
-            LOG.warning("URI %(uri)s does not support events: %(error)s",
-                        {'uri': self._uri, 'error': e})
-
-        try:
-            LOG.debug("Registering for connection events: %s", str(self))
-            wrapped_conn.registerCloseCallback(self._close_callback, None)
-        except (TypeError, AttributeError) as e:
-            # NOTE: The registerCloseCallback of python-libvirt 1.0.1+
-            # is defined with 3 arguments, and the above registerClose-
-            # Callback succeeds. However, the one of python-libvirt 1.0.0
-            # is defined with 4 arguments and TypeError happens here.
-            # Then python-libvirt 0.9 does not define a method register-
-            # CloseCallback.
-            LOG.debug("The version of python-libvirt does not support "
-                      "registerCloseCallback or is too old: %s", e)
-        except libvirt.libvirtError as e:
-            LOG.warning("URI %(uri)s does not support connection"
-                        " events: %(error)s",
-                        {'uri': self._uri, 'error': e})
-
-        return wrapped_conn
-
-    def _queue_conn_event_handler(self, *args, **kwargs):
-        if self._conn_event_handler is None:
-            return
-
-        def handler():
-            return self._conn_event_handler(*args, **kwargs)
-
-        self._conn_event_handler_queue.put(handler)
-
-    def _get_connection(self, new_conn=False):
-        if new_conn:
-            LOG.debug("Get a newly connection to libvirt.")
-            return self._connect(self._uri, self._read_only)
-
-        # multiple concurrent connections are protected by _wrapped_conn_lock
-        with self._wrapped_conn_lock:
-            # Drop the existing connection if it is not usable
-            if (self._wrapped_conn is not None and
-                    not self._test_connection(self._wrapped_conn)):
-                self._wrapped_conn = None
-                # Connection was previously up, and went down
-                self._queue_conn_event_handler(
-                    False, 'Connection to libvirt lost')
-
-            if self._wrapped_conn is None:
-                try:
-                    # This will raise if it fails to get a connection
-                    self._wrapped_conn = self._get_new_connection()
-                except Exception as ex:
-                    # with excutils.save_and_reraise_exception():
-                    # If we previously had a connection and it went down,
-                    # we generated a down event for that above.
-                    # We also want to generate a down event for an initial
-                    # failure, which won't be handled above.
-                    if self._initial_connection:
-                        self._queue_conn_event_handler(
-                            False,
-                            'Failed to connect to libvirt: %(msg)s' %
-                            {'msg': ex})
-                    raise ex
-
-                finally:
-                    self._initial_connection = False
-
-                self._queue_conn_event_handler(True, None)
-
-        return self._wrapped_conn
-
-    def get_connection(self, new_conn=False):
-        """Returns a connection to the hypervisor
-
-        This method should be used to create and return a well
-        configured connection to the hypervisor.
-
-        :returns: a libvirt.virConnect object
-        """
-        try:
-            conn = self._get_connection(new_conn)
-        except libvirt.libvirtError as ex:
-            LOG.exception("Connection to libvirt failed: %s", ex)
-            raise exception.HypervisorUnavailable(host=CONF.host)
-
-        return conn
+        LOG.debug("Starting connection event dispatch thread")
+        utils.spawn(self._conn_event_thread)
 
     @staticmethod
     def _libvirt_error_handler(context, err):
         # Just ignore instead of default outputting to stderr.
         pass
 
-    def initialize(self):
-        libvirt.registerErrorHandler(self._libvirt_error_handler, None)
-        libvirt.virEventRegisterDefaultImpl()
+    def init_host(self):
         self._init_events()
 
-        LOG.debug("Starting connection event dispatch thread")
-        utils.spawn(self._conn_event_thread)
-
-        self._initialized = True
+        # Get a new connection, then register lifecycle and
+        # connection close event callback function
+        self._wrapped_conn = connection.LibvirtConnection(
+            conn_event_handler=self._conn_event_handler,
+            conn_event_handler_queue=self._conn_event_handler_queue)
+        self._wrapped_conn.get_connection()
+        self._register_event_callback()
 
     def _version_check(self, lv_ver=None, hv_ver=None, hv_type=None,
                        op=operator.lt):
@@ -436,7 +252,7 @@ class Host(object):
 
         :param hv_type: hypervisor driver from the top of this file.
         """
-        conn = self.get_connection()
+        conn = self._wrapped_conn.get_connection()
         try:
             if lv_ver is not None:
                 libvirt_version = conn.getLibVersion()
@@ -467,161 +283,33 @@ class Host(object):
         return self._version_check(
             lv_ver=lv_ver, hv_ver=hv_ver, hv_type=hv_type, op=operator.ne)
 
-    def get_domain(self, uuid, new_conn=False):
-        """Retrieve libvirt domain object for an instance.
+    def _register_event_callback(self):
+        conn = self._wrapped_conn.get_connection()
 
-        All libvirt error handling should be handled in this method and
-        relevant nova exceptions should be raised in response.
-
-        :param instance: a nova.objects.Instance object
-
-        :returns: a libvirt.Domain object
-        :raises exception.InstanceNotFound: The domain was not found
-        :raises exception.InternalError: A libvirt error occured
-        """
         try:
-            conn = self.get_connection(new_conn)
-            return conn.lookupByUUIDString(uuid)
-        except libvirt.libvirtError as ex:
-            error_code = ex.get_error_code()
-            if error_code == libvirt.VIR_ERR_NO_DOMAIN:
-                raise exception.InstanceNotFound(instance_id=uuid)
-
-            msg = ('Error from libvirt while looking up %(uuid)s: '
-                   '[Error Code %(error_code)s] %(ex)s' %
-                   {'uuid': uuid,
-                    'error_code': error_code,
-                    'ex': ex})
-            raise exception.InternalError(msg)
-
-    def list_instance_domains(self, only_running=True, only_guests=True):
-        """Get a list of libvirt.Domain objects for nova instances
-
-        :param only_running: True to only return running instances
-        :param only_guests: True to filter out any host domain (eg Dom-0)
-
-        Query libvirt to a get a list of all libvirt.Domain objects
-        that correspond to nova instances. If the only_running parameter
-        is true this list will only include active domains, otherwise
-        inactive domains will be included too. If the only_guests parameter
-        is true the list will have any "host" domain (aka Xen Domain-0)
-        filtered out.
-
-        :returns: list of libvirt.Domain objects
-        """
-        flags = libvirt.VIR_CONNECT_LIST_DOMAINS_ACTIVE
-        if not only_running:
-            flags = flags | libvirt.VIR_CONNECT_LIST_DOMAINS_INACTIVE
-        alldoms = self.get_connection().listAllDomains(flags)
-
-        doms = []
-        for dom in alldoms:
-            if only_guests and dom.ID() == 0:
-                continue
-            doms.append(dom)
-
-        return doms
-
-    def get_online_cpus(self):
-        """Get the set of CPUs that are online on the host
-
-        Method is only used by NUMA code paths which check on
-        libvirt version >= 1.0.4. getCPUMap() was introduced in
-        libvirt 1.0.0.
-
-        :returns: set of online CPUs, raises libvirtError on error
-
-        """
-
-        (cpus, cpu_map, online) = self.get_connection().getCPUMap()
-
-        online_cpus = set()
-        for cpu in range(cpus):
-            if cpu_map[cpu]:
-                online_cpus.add(cpu)
-
-        return online_cpus
-
-    def get_driver_type(self):
-        """Get hypervisor type.
-
-        :returns: hypervisor type (ex. qemu)
-
-        """
-
-        return self.get_connection().getType()
-
-    def get_version(self):
-        """Get hypervisor version.
-
-        :returns: hypervisor version (ex. 12003)
-
-        """
-
-        return self.get_connection().getVersion()
-
-    def get_hostname(self):
-        """Returns the hostname of the hypervisor."""
-        hostname = self.get_connection().getHostname()
-        if self._hostname is None:
-            self._hostname = hostname
-        elif hostname != self._hostname:
-            LOG.error('Hostname has changed from %(old)s '
-                      'to %(new)s. A restart is required to take effect.',
-                      {'old': self._hostname,
-                       'new': hostname})
-        return self._hostname
-
-    def _qemu_monitor_event_callback(self, conn, dom, event,
-                                     seconds, micros, details,
-                                     opaque):
-        qemu_mon_q = opaque
-        if qemu_mon_q is None:
-            return
-
-        uuid = dom.UUIDString()
-        job_status = event
-        # if event == libvirt.VIR_DOMAIN_JOB_COMPLETED:
-        #     job_status = libvirt.VIR_DOMAIN_JOB_COMPLETED
-
-        # if job_status is not None:
-        #     qm_event = virtevent.QemuMonitorEvent(uuid, job_status, seconds)
-        #     qemu_monitor_queue.put(qm_event)
-
-        qm_event = virtevent.QemuMonitorEvent(uuid, job_status, seconds, details)
-        qemu_mon_q.put(qm_event)
-        # LOG.debug("qemu_monitor_event_callback Queue: %s, EVENT: "
-        #           "Domain %s(%s) %s, DETAILS:%s" %
-        #           (opaque, dom.name(), dom.ID(), qm_event.get_status(),
-        #            qm_event.get_details()))
-
-    def register_qemu_monitor_event(self, dom=None, event_q=None):
-        opaque = event_q
-        conn = dom.connect()
-        try:
-            LOG.info("Registering for qemu monitor events: %s for domain %s",
-                     self, dom.UUIDString())
-            id = libvirt_qemu.qemuMonitorEventRegister(
-                conn,
-                dom,
+            LOG.debug("Registering for lifecycle events: %s", self)
+            conn.domainEventRegisterAny(
                 None,
-                self._qemu_monitor_event_callback,
-                opaque
-            )
+                libvirt.VIR_DOMAIN_EVENT_ID_LIFECYCLE,
+                self._event_lifecycle_callback,
+                self)
         except Exception as e:
+            LOG.warning("URI %(uri)s does not support events: %(error)s",
+                        {'uri': self._wrapped_conn.uri, 'error': e})
+
+        try:
+            LOG.debug("Registering for connection events: %s", str(self))
+            conn.registerCloseCallback(self._close_callback, None)
+        except (TypeError, AttributeError) as e:
+            # NOTE: The registerCloseCallback of python-libvirt 1.0.1+
+            # is defined with 3 arguments, and the above registerClose-
+            # Callback succeeds. However, the one of python-libvirt 1.0.0
+            # is defined with 4 arguments and TypeError happens here.
+            # Then python-libvirt 0.9 does not define a method register-
+            # CloseCallback.
+            LOG.debug("The version of python-libvirt does not support "
+                      "registerCloseCallback or is too old: %s", e)
+        except libvirt.libvirtError as e:
             LOG.warning("URI %(uri)s does not support connection"
                         " events: %(error)s",
-                        {'uri': self._uri, 'error': e})
-
-        return id
-
-    def deregister_qemu_monitor_event(self, domain, callback_id):
-        conn = domain.connect()
-        try:
-            LOG.info("Deregistering for qemu monitor events callback: %s",
-                     callback_id)
-            libvirt_qemu.qemuMonitorEventDeregister(conn, callback_id)
-        except Exception as ex:
-            LOG.exception("Failed to deregister qemu monitor event "
-                          "callback id %(id)s, error: %(error)s",
-                          {'id': callback_id, 'error': ex})
+                        {'uri': self._wrapped_conn.uri, 'error': e})

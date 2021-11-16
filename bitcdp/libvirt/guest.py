@@ -1,26 +1,20 @@
-
+import logging
 from lxml import etree
-from oslo_log import log as logging
-from oslo_service import loopingcall
-from oslo_utils import encodeutils
-from oslo_utils import excutils
-from oslo_utils import importutils
 import six
-import time
+import contextlib
 
-from nova.compute import power_state
-from nova import exception
-from nova.i18n import _
-from nova.i18n import _LE
-from nova.i18n import _LW
-from nova import utils
-from nova.virt import hardware
-from nova.virt.libvirt import compat
-from nova.virt.libvirt import config as vconfig
+import libvirt
+import libvirt_qemu
+from eventlet import patcher
 
-libvirt = None
+from bitcdp import exception
+from bitcdp.libvirt import event as virtevent
+from bitcdp.libvirt import config as vconfig
+from bitcdp.libvirt import power_state
+from bitcdp.libvirt import monitor
 
 LOG = logging.getLogger(__name__)
+native_Queue = patcher.original("Queue" if six.PY2 else "queue")
 
 VIR_DOMAIN_NOSTATE = 0
 VIR_DOMAIN_RUNNING = 1
@@ -53,12 +47,9 @@ LIBVIRT_POWER_STATE = {
 class Guest(object):
 
     def __init__(self, domain):
-
-        global libvirt
-        if libvirt is None:
-            libvirt = importutils.import_module('libvirt')
-
+        self._event_queue = None
         self._domain = domain
+        self._qemu_mon = monitor.QemuMonitor(self._domain)
 
     def __repr__(self):
         return "<Guest %(id)d %(name)s %(uuid)s>" % {
@@ -80,205 +71,8 @@ class Guest(object):
         return self._domain.name()
 
     @property
-    def _encoded_xml(self):
-        return encodeutils.safe_decode(self._domain.XMLDesc(0))
-
-    @classmethod
-    def create(cls, xml, host):
-        """Create a new Guest
-
-        :param xml: XML definition of the domain to create
-        :param host: host.Host connection to define the guest on
-
-        :returns guest.Guest: Guest ready to be launched
-        """
-        try:
-            if six.PY3 and isinstance(xml, six.binary_type):
-                xml = xml.decode('utf-8')
-            guest = host.write_instance_config(xml)
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                LOG.error(_LE('Error defining a guest with XML: %s'),
-                          encodeutils.safe_decode(xml))
-        return guest
-
-    def launch(self, pause=False):
-        """Starts a created guest.
-
-        :param pause: Indicates whether to start and pause the guest
-        """
-        flags = pause and libvirt.VIR_DOMAIN_START_PAUSED or 0
-        try:
-            return self._domain.createWithFlags(flags)
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                LOG.error(_LE('Error launching a defined domain '
-                              'with XML: %s'),
-                          self._encoded_xml, errors='ignore')
-
-    def poweroff(self):
-        """Stops a running guest."""
-        self._domain.destroy()
-
-    def sync_guest_time(self):
-        """Try to set VM time to the current value.  This is typically useful
-        when clock wasn't running on the VM for some time (e.g. during
-        suspension or migration), especially if the time delay exceeds NTP
-        tolerance.
-
-        It is not guaranteed that the time is actually set (it depends on guest
-        environment, especially QEMU agent presence) or that the set time is
-        very precise (NTP in the guest should take care of it if needed).
-        """
-        t = time.time()
-        seconds = int(t)
-        nseconds = int((t - seconds) * 10 ** 9)
-        try:
-            self._domain.setTime(time={'seconds': seconds,
-                                       'nseconds': nseconds})
-        except libvirt.libvirtError as e:
-            code = e.get_error_code()
-            if code == libvirt.VIR_ERR_AGENT_UNRESPONSIVE:
-                LOG.debug('Failed to set time: QEMU agent unresponsive',
-                          instance_uuid=self.uuid)
-            elif code == libvirt.VIR_ERR_NO_SUPPORT:
-                LOG.debug('Failed to set time: not supported',
-                          instance_uuid=self.uuid)
-            elif code == libvirt.VIR_ERR_ARGUMENT_UNSUPPORTED:
-                LOG.debug('Failed to set time: agent not configured',
-                          instance_uuid=self.uuid)
-            else:
-                LOG.warning(_LW('Failed to set time: %(reason)s'),
-                            {'reason': e}, instance_uuid=self.uuid)
-        except Exception as ex:
-            # The highest priority is not to let this method crash and thus
-            # disrupt its caller in any way.  So we swallow this error here,
-            # to be absolutely safe.
-            LOG.debug('Failed to set time: %(reason)s',
-                      {'reason': ex}, instance_uuid=self.uuid)
-        else:
-            LOG.debug('Time updated to: %d.%09d', seconds, nseconds,
-                      instance_uuid=self.uuid)
-
-    def inject_nmi(self):
-        """Injects an NMI to a guest."""
-        self._domain.injectNMI()
-
-    def resume(self):
-        """Resumes a paused guest."""
-        self._domain.resume()
-
-    def enable_hairpin(self):
-        """Enables hairpin mode for this guest."""
-        interfaces = self.get_interfaces()
-        try:
-            for interface in interfaces:
-                utils.execute(
-                    'tee',
-                    '/sys/class/net/%s/brport/hairpin_mode' % interface,
-                    process_input='1',
-                    run_as_root=True,
-                    check_exit_code=[0, 1])
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                LOG.error(_LE('Error enabling hairpin mode with XML: %s'),
-                          self._encoded_xml, errors='ignore')
-
-    def get_interfaces(self):
-        """Returns a list of all network interfaces for this domain."""
-        doc = None
-
-        try:
-            doc = etree.fromstring(self._encoded_xml)
-        except Exception:
-            return []
-
-        interfaces = []
-
-        nodes = doc.findall('./devices/interface/target')
-        for target in nodes:
-            interfaces.append(target.get('dev'))
-
-        return interfaces
-
-    def get_interface_by_cfg(self, cfg):
-        """Lookup a full LibvirtConfigGuestInterface with
-        LibvirtConfigGuestInterface generated
-        by nova.virt.libvirt.vif.get_config.
-
-        :param cfg: config object that represents the guest interface.
-        :type cfg: LibvirtConfigGuestInterface object
-        :returns: nova.virt.libvirt.config.LibvirtConfigGuestInterface instance
-            if found, else None
-        """
-
-        if cfg:
-            interfaces = self.get_all_devices(
-                vconfig.LibvirtConfigGuestInterface)
-            for interface in interfaces:
-                # NOTE(leehom) LibvirtConfigGuestInterface get from domain and
-                # LibvirtConfigGuestInterface generated by
-                # nova.virt.libvirt.vif.get_config must be identical.
-                if (interface.mac_addr == cfg.mac_addr and
-                        interface.net_type == cfg.net_type and
-                        interface.source_dev == cfg.source_dev and
-                        interface.target_dev == cfg.target_dev and
-                        interface.vhostuser_path == cfg.vhostuser_path):
-                    return interface
-
-    def get_vcpus_info(self):
-        """Returns virtual cpus information of guest.
-
-        :returns: guest.VCPUInfo
-        """
-        vcpus = self._domain.vcpus()
-        for vcpu in vcpus[0]:
-            yield VCPUInfo(
-                id=vcpu[0], cpu=vcpu[3], state=vcpu[1], time=vcpu[2])
-
-    def delete_configuration(self, support_uefi=False):
-        """Undefines a domain from hypervisor."""
-        try:
-            flags = libvirt.VIR_DOMAIN_UNDEFINE_MANAGED_SAVE
-            if support_uefi:
-                flags |= libvirt.VIR_DOMAIN_UNDEFINE_NVRAM
-            self._domain.undefineFlags(flags)
-        except libvirt.libvirtError:
-            LOG.debug("Error from libvirt during undefineFlags. %d"
-                      "Retrying with undefine", self.id)
-            self._domain.undefine()
-        except AttributeError:
-            # Older versions of libvirt don't support undefine flags,
-            # trying to remove managed image
-            try:
-                if self._domain.hasManagedSaveImage(0):
-                    self._domain.managedSaveRemove(0)
-            except AttributeError:
-                pass
-            self._domain.undefine()
-
-    def has_persistent_configuration(self):
-        """Whether domain config is persistently stored on the host."""
-        return self._domain.isPersistent()
-
-    def attach_device(self, conf, persistent=False, live=False):
-        """Attaches device to the guest.
-
-        :param conf: A LibvirtConfigObject of the device to attach
-        :param persistent: A bool to indicate whether the change is
-                           persistent or not
-        :param live: A bool to indicate whether it affect the guest
-                     in running state
-        """
-        flags = persistent and libvirt.VIR_DOMAIN_AFFECT_CONFIG or 0
-        flags |= live and libvirt.VIR_DOMAIN_AFFECT_LIVE or 0
-
-        device_xml = conf.to_xml()
-        if six.PY3 and isinstance(device_xml, six.binary_type):
-            device_xml = device_xml.decode('utf-8')
-
-        LOG.debug("attach device xml: %s", device_xml)
-        self._domain.attachDeviceFlags(device_xml, flags=flags)
+    def domain(self):
+        return self._domain
 
     def get_disk(self, device):
         """Returns the disk mounted at device
@@ -329,122 +123,9 @@ class Guest(object):
         devs = []
         for dev in config.devices:
             if (devtype is None or
-                isinstance(dev, devtype)):
+                    isinstance(dev, devtype)):
                 devs.append(dev)
         return devs
-
-    def detach_device_with_retry(self, get_device_conf_func, device, live,
-                                 max_retry_count=7, inc_sleep_time=2,
-                                 max_sleep_time=30,
-                                 alternative_device_name=None):
-        """Detaches a device from the guest. After the initial detach request,
-        a function is returned which can be used to ensure the device is
-        successfully removed from the guest domain (retrying the removal as
-        necessary).
-
-        :param get_device_conf_func: function which takes device as a parameter
-                                     and returns the configuration for device
-        :param device: device to detach
-        :param live: bool to indicate whether it affects the guest in running
-                     state
-        :param max_retry_count: number of times the returned function will
-                                retry a detach before failing
-        :param inc_sleep_time: incremental time to sleep in seconds between
-                               detach retries
-        :param max_sleep_time: max sleep time in seconds beyond which the sleep
-                               time will not be incremented using param
-                               inc_sleep_time. On reaching this threshold,
-                               max_sleep_time will be used as the sleep time.
-        :param alternative_device_name: This is an alternative identifier for
-            the device if device is not an ID, used solely for error messages.
-        """
-        alternative_device_name = alternative_device_name or device
-
-        def _try_detach_device(conf, persistent=False, live=False):
-            # Raise DeviceNotFound if the device isn't found during detach
-            try:
-                self.detach_device(conf, persistent=persistent, live=live)
-                LOG.debug('Successfully detached device %s from guest. '
-                          'Persistent? %s. Live? %s',
-                          device, persistent, live)
-            except libvirt.libvirtError as ex:
-                with excutils.save_and_reraise_exception():
-                    errcode = ex.get_error_code()
-                    if errcode == libvirt.VIR_ERR_OPERATION_FAILED:
-                        errmsg = ex.get_error_message()
-                        if 'not found' in errmsg:
-                            # This will be raised if the live domain
-                            # detach fails because the device is not found
-                            raise exception.DeviceNotFound(
-                                device=alternative_device_name)
-                    elif errcode == libvirt.VIR_ERR_INVALID_ARG:
-                        errmsg = ex.get_error_message()
-                        if 'no target device' in errmsg:
-                            # This will be raised if the persistent domain
-                            # detach fails because the device is not found
-                            raise exception.DeviceNotFound(
-                                device=alternative_device_name)
-
-        conf = get_device_conf_func(device)
-        if conf is None:
-            raise exception.DeviceNotFound(device=alternative_device_name)
-
-        persistent = self.has_persistent_configuration()
-
-        LOG.debug('Attempting initial detach for device %s',
-                  alternative_device_name)
-        try:
-            _try_detach_device(conf, persistent, live)
-        except exception.DeviceNotFound:
-            # NOTE(melwitt): There are effectively two configs for an instance.
-            # The persistent config (affects instance upon next boot) and the
-            # live config (affects running instance). When we detach a device,
-            # we need to detach it from both configs if the instance has a
-            # persistent config and a live config. If we tried to detach the
-            # device with persistent=True and live=True and it was not found,
-            # we should still try to detach from the live config, so continue.
-            if persistent and live:
-                pass
-            else:
-                raise
-        LOG.debug('Start retrying detach until device %s is gone.',
-                  alternative_device_name)
-
-        @loopingcall.RetryDecorator(max_retry_count=max_retry_count,
-                                    inc_sleep_time=inc_sleep_time,
-                                    max_sleep_time=max_sleep_time,
-                                    exceptions=exception.DeviceDetachFailed)
-        def _do_wait_and_retry_detach():
-            config = get_device_conf_func(device)
-            if config is not None:
-                # Device is already detached from persistent domain
-                # and only transient domain needs update
-                _try_detach_device(config, persistent=False, live=live)
-
-                reason = _("Unable to detach from guest transient domain.")
-                raise exception.DeviceDetachFailed(
-                    device=alternative_device_name, reason=reason)
-
-        return _do_wait_and_retry_detach
-
-    def detach_device(self, conf, persistent=False, live=False):
-        """Detaches device to the guest.
-
-        :param conf: A LibvirtConfigObject of the device to detach
-        :param persistent: A bool to indicate whether the change is
-                           persistent or not
-        :param live: A bool to indicate whether it affect the guest
-                     in running state
-        """
-        flags = persistent and libvirt.VIR_DOMAIN_AFFECT_CONFIG or 0
-        flags |= live and libvirt.VIR_DOMAIN_AFFECT_LIVE or 0
-
-        device_xml = conf.to_xml()
-        if six.PY3 and isinstance(device_xml, six.binary_type):
-            device_xml = device_xml.decode('utf-8')
-
-        LOG.debug("detach device xml: %s", device_xml)
-        self._domain.detachDeviceFlags(device_xml, flags=flags)
 
     def get_xml_desc(self, dump_inactive=False, dump_sensitive=False,
                      dump_migratable=False):
@@ -460,13 +141,6 @@ class Guest(object):
         flags |= dump_sensitive and libvirt.VIR_DOMAIN_XML_SECURE or 0
         flags |= dump_migratable and libvirt.VIR_DOMAIN_XML_MIGRATABLE or 0
         return self._domain.XMLDesc(flags=flags)
-
-    def save_memory_state(self):
-        """Saves the domain's memory state. Requires running domain.
-
-        raises: raises libvirtError on error
-        """
-        self._domain.managedSave(0)
 
     def get_block_device(self, disk):
         """Returns a block device wrapper for disk."""
@@ -533,124 +207,9 @@ class Guest(object):
         """Thaw filesystems within guest."""
         self._domain.fsThaw()
 
-    def snapshot(self, conf, no_metadata=False,
-                 disk_only=False, reuse_ext=False, quiesce=False):
-        """Creates a guest snapshot.
-
-        :param conf: libvirt.LibvirtConfigGuestSnapshotDisk
-        :param no_metadata: Make snapshot without remembering it
-        :param disk_only: Disk snapshot, no system checkpoint
-        :param reuse_ext: Reuse any existing external files
-        :param quiesce: Use QGA to quiece all mounted file systems
-        """
-        flags = no_metadata and (libvirt.VIR_DOMAIN_SNAPSHOT_CREATE_NO_METADATA
-                                 or 0)
-        flags |= disk_only and (libvirt.VIR_DOMAIN_SNAPSHOT_CREATE_DISK_ONLY
-                                or 0)
-        flags |= reuse_ext and (libvirt.VIR_DOMAIN_SNAPSHOT_CREATE_REUSE_EXT
-                                or 0)
-        flags |= quiesce and libvirt.VIR_DOMAIN_SNAPSHOT_CREATE_QUIESCE or 0
-
-        device_xml = conf.to_xml()
-        if six.PY3 and isinstance(device_xml, six.binary_type):
-            device_xml = device_xml.decode('utf-8')
-
-        self._domain.snapshotCreateXML(device_xml, flags=flags)
-
-    def shutdown(self):
-        """Shutdown guest"""
-        self._domain.shutdown()
-
-    def pause(self):
-        """Suspends an active guest
-
-        Process is frozen without further access to CPU resources and
-        I/O but the memory used by the domain at the hypervisor level
-        will stay allocated.
-
-        See method "resume()" to reactive guest.
-        """
-        self._domain.suspend()
-
-    def migrate(self, destination, migrate_uri=None, params=None, flags=0,
-                domain_xml=None, bandwidth=0):
-        """Migrate guest object from its current host to the destination
-
-        :param destination: URI of host destination where guest will be migrate
-        :param migrate_uri: URI for invoking the migration
-        :param flags: May be one of more of the following:
-           VIR_MIGRATE_LIVE Do not pause the VM during migration
-           VIR_MIGRATE_PEER2PEER Direct connection between source &
-                                 destination hosts
-           VIR_MIGRATE_TUNNELLED Tunnel migration data over the
-                                 libvirt RPC channel
-           VIR_MIGRATE_PERSIST_DEST If the migration is successful,
-                                    persist the domain on the
-                                    destination host.
-           VIR_MIGRATE_UNDEFINE_SOURCE If the migration is successful,
-                                       undefine the domain on the
-                                       source host.
-           VIR_MIGRATE_PAUSED Leave the domain suspended on the remote
-                              side.
-           VIR_MIGRATE_NON_SHARED_DISK Migration with non-shared
-                                       storage with full disk copy
-           VIR_MIGRATE_NON_SHARED_INC Migration with non-shared
-                                      storage with incremental disk
-                                      copy
-           VIR_MIGRATE_CHANGE_PROTECTION Protect against domain
-                                         configuration changes during
-                                         the migration process (set
-                                         automatically when
-                                         supported).
-           VIR_MIGRATE_UNSAFE Force migration even if it is considered
-                              unsafe.
-           VIR_MIGRATE_OFFLINE Migrate offline
-        :param domain_xml: Changing guest configuration during migration
-        :param bandwidth: The maximun bandwidth in MiB/s
-        """
-        if domain_xml is None:
-            self._domain.migrateToURI(
-                destination, flags=flags, bandwidth=bandwidth)
-        else:
-            if params:
-                # Due to a quirk in the libvirt python bindings,
-                # VIR_MIGRATE_NON_SHARED_INC with an empty migrate_disks is
-                # interpreted as "block migrate all writable disks" rather than
-                # "don't block migrate any disks". This includes attached
-                # volumes, which will potentially corrupt data on those
-                # volumes. Consequently we need to explicitly unset
-                # VIR_MIGRATE_NON_SHARED_INC if there are no disks to be block
-                # migrated.
-                if (flags & libvirt.VIR_MIGRATE_NON_SHARED_INC != 0 and
-                        not params.get('migrate_disks')):
-                    flags &= ~libvirt.VIR_MIGRATE_NON_SHARED_INC
-
-                # In migrateToURI3 these parameters are extracted from the
-                # `params` dict
-                if migrate_uri:
-                    params['migrate_uri'] = migrate_uri
-                params['bandwidth'] = bandwidth
-                self._domain.migrateToURI3(
-                    destination, params=params, flags=flags)
-            else:
-                self._domain.migrateToURI2(
-                    destination, miguri=migrate_uri, dxml=domain_xml,
-                    flags=flags, bandwidth=bandwidth)
-
     def abort_job(self):
         """Requests to abort current background job"""
         self._domain.abortJob()
-
-    def migrate_configure_max_downtime(self, mstime):
-        """Sets maximum time for which domain is allowed to be paused
-
-        :param mstime: Downtime in milliseconds.
-        """
-        self._domain.migrateSetMaxDowntime(mstime)
-
-    def migrate_start_postcopy(self):
-        """Switch running live migration to post-copy mode"""
-        self._domain.migrateStartPostCopy()
 
     def get_job_info(self):
         """Get job info for the domain
@@ -687,6 +246,112 @@ class Guest(object):
                 return JobInfo._get_job_stats_compat(self._domain)
         else:
             return JobInfo._get_job_stats_compat(self._domain)
+
+    def register_qemu_monitor_event(self):
+        # event_q = six.moves.queue.Queue()
+        if self._event_queue is None:
+            self._event_queue = native_Queue.Queue()
+
+        conn = self._domain.connect()
+        try:
+            LOG.info("Registering for qemu monitor events: %s for domain %s",
+                     self, self.uuid)
+            id = libvirt_qemu.qemuMonitorEventRegister(
+                conn,
+                self._domain,
+                None,
+                self._qemu_monitor_event_callback,
+                self._event_queue
+            )
+        except Exception as e:
+            LOG.warning("URI %(uri)s does not support qemu monitor"
+                        " events: %(error)s",
+                        {'uri': conn.getURI(), 'error': e})
+
+        return id
+
+    def _qemu_monitor_event_callback(self, conn, dom, event,
+                                     seconds, micros, details,
+                                     opaque):
+        if id(opaque) != id(self._event_queue):
+            return
+
+        uuid = dom.UUIDString()
+        job_status = event
+        # if event == libvirt.VIR_DOMAIN_JOB_COMPLETED:
+        #     job_status = libvirt.VIR_DOMAIN_JOB_COMPLETED
+
+        # if job_status is not None:
+        #     qm_event = virtevent.QemuMonitorEvent(uuid, job_status, seconds)
+        #     qemu_monitor_queue.put(qm_event)
+
+        qm_event = virtevent.QemuMonitorEvent(uuid, job_status, seconds, details)
+        self._event_queue.put(qm_event)
+        # LOG.debug("qemu_monitor_event_callback Queue: %s, EVENT: "
+        #           "Domain %s(%s) %s, DETAILS:%s" %
+        #           (opaque, dom.name(), dom.ID(), qm_event.get_status(),
+        #            qm_event.get_details()))
+
+    @staticmethod
+    def _event_match(event, match=None):
+        if match is None:
+            return True
+        if not isinstance(event, virtevent.QemuMonitorEvent):
+            return False
+
+        if event.get_status() == match:
+            return True
+        else:
+            return False
+
+    @contextlib.contextmanager
+    def wait_qemu_monitor_event(self, timeout=None, match=None):
+        while True:
+            event = self._event_queue.get(True, timeout)
+            LOG.debug("Emitting qemu monitor event %s", six.text_type(event))
+            if self._event_match(event, match):
+                break
+
+        yield event
+
+    def deregister_qemu_monitor_event(self, callback_id):
+        conn = self._domain.connect()
+        try:
+            LOG.info("Deregistering for qemu monitor events callback: %s",
+                     callback_id)
+            libvirt_qemu.qemuMonitorEventDeregister(conn, callback_id)
+        except Exception as ex:
+            LOG.exception("Failed to deregister qemu monitor event "
+                          "callback id %(id)s, error: %(error)s",
+                          {'id': callback_id, 'error': ex})
+
+    def qm_query_block(self):
+        return self._qemu_mon.query_block()
+
+    def qm_full_backup_with_bitmap(self, dev, target, format="qcow2",
+                                   sync="full", **kwargs):
+        LOG.debug("Begin to do full backup for instance %(domain)s at target %(target)s.",
+                  {"domain": self.uuid, "target": target})
+        self._qemu_mon.full_backup_with_bitmap(dev, target, format, sync)
+
+        try:
+            with self.wait_qemu_monitor_event(
+                    timeout=30, match="BLOCK_JOB_COMPLETED") as event:
+                LOG.debug("Received full backup COMPLETED event "
+                          "from domain, %s", event)
+        except Exception as e:
+            raise e
+
+    def qm_inc_backup(self, dev, target, format="qcow2",
+                      sync="incremental", **kwargs):
+        LOG.debug("Begin to do incremental backup for instance %(domain)s "
+                  "at target %(target)s.",
+                  {"domain": self.uuid, "target": target})
+        self._qemu_mon.inc_backup(dev, target, format, sync)
+
+        with self.wait_qemu_monitor_event(
+                timeout=30, match="BLOCK_JOB_COMPLETED") as event:
+            LOG.debug("Received inc backup COMPLETED event from domain, %s", event)
 
 
 class BlockDevice(object):
@@ -818,22 +483,6 @@ class BlockDevice(object):
                 return disk.mirror.ready == 'yes'
 
         return False
-
-
-class VCPUInfo(object):
-    def __init__(self, id, cpu, state, time):
-        """Structure for information about guest vcpus.
-
-        :param id: The virtual cpu number
-        :param cpu: The host cpu currently associated
-        :param state: The running state of the vcpu (0 offline, 1 running, 2
-                      blocked on resource)
-        :param time: The cpu time used in nanoseconds
-        """
-        self.id = id
-        self.cpu = cpu
-        self.state = state
-        self.time = time
 
 
 class BlockDeviceJobInfo(object):

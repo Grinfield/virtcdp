@@ -30,8 +30,16 @@ class BackupConductor(object):
 
     def backup(self, uuid, *args):
         # name = 'cirros_test1'
-        uuid = '4b371dcb-ee9c-4109-b2eb-5768e6d3c84a'
-        ret = self.driver.drive_backup(uuid, disk=None)
+        uuid = 'e50874d7-3cb8-4b51-aba2-a76ab270d656'
+        targetdir = "/tmp/backup/"
+        format = "qcow2"
+        interval = 10
+
+        kwargs = {"targetdir": targetdir,
+                  "format": format,
+                  "disk": None,
+                  "interval": interval}
+        ret = self.driver.drive_backup(uuid, **kwargs)
         return ret
 
     def stop_backup(self, uuid):

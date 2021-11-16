@@ -73,9 +73,9 @@ class NoBlockdevsFound(NotFound):
 
 
 class QemuMonitorCommandError(BitcdpException):
-    msg_fmt = "Error occurred in executing qemu monitor command '%(cmd)s'," \
-              "for domain '%(domain)s', arguments: %(args)s, class: " \
-              "'%(class)s', error desc: '%(desc)s'."
+    msg_fmt = "Failed to execute qemu monitor command '%(cmd)s' " \
+              "for domain '%(domain)s', arguments: '%(args)s', class: " \
+              "'%(cls)s', desc: '%(desc)s'."
 
 
 class Invalid(BitcdpException):
@@ -85,3 +85,8 @@ class Invalid(BitcdpException):
 
 class InvalidInput(Invalid):
     msg_fmt = "Invalid input received: %(reason)s"
+
+
+class IncBackupNoBitmapException(Invalid):
+    msg_fmt = "Device %(dev)s of instance %(uuid)s do incremental " \
+              "backup without bitmap."
