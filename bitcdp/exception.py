@@ -90,3 +90,11 @@ class InvalidInput(Invalid):
 class IncBackupNoBitmapException(Invalid):
     msg_fmt = "Device %(dev)s of instance %(uuid)s do incremental " \
               "backup without bitmap."
+
+
+class InstanceNotInBackup(Invalid):
+    msg_fmt = "Requested instance %(uuid)s has no backup task."
+
+
+class DiskNotInBackup(Invalid):
+    msg_fmt = "Requested disk %(disk)s of instance %(uuid)s has no backup task."

@@ -2,6 +2,7 @@ import logging
 import six
 import time
 import os
+import collections
 
 from eventlet import patcher
 from oslo_config import cfg
@@ -33,6 +34,7 @@ class LibvirtDriver(object):
         self._host = host.Host(conn_event_handler=self._handle_conn_event,
                                lifecycle_event_handler=self.emit_event)
         self._compute_event_callback = None
+        self.timers = collections.defaultdict(dict)
 
     def init_host(self):
         self.event_handler.initialize()
@@ -139,14 +141,13 @@ class LibvirtDriver(object):
     def _version_to_string(self, version):
         return '.'.join([str(x) for x in version])
 
-    @staticmethod
-    def _do_instance_backup(guest, targetdir, format,
+    def _do_instance_backup(self, guest, targetdir, format,
                             interval, disk=None, **kwargs):
         devices = guest.qm_query_block()
 
         def _inc_backup(device):
-            # Do incremental backup
-            # /targdetdir/domain/node/INC-timestamp
+            # Do incremental backup for device
+            # target: /targdetdir/domain/node/INC-timestamp
             target = os.path.join(targetdir, guest.uuid,
                                   device.node, "INC-%s" % int(time.time()))
             if not os.path.exists(os.path.dirname(target)):
@@ -170,10 +171,12 @@ class LibvirtDriver(object):
             # Create a looping call to do periodic incremental backup
             timer = loopingcall.FixedIntervalLoopingCall(_inc_backup,
                                                          dev)
+            self.timers[guest.uuid][dev.node] = timer
             # `initial_delay` means sleep for `interval` duration,
             # then start the loop and wait the done event that tell
             # the loop to exit
             timer.start(interval=interval, initial_delay=interval).wait()
+            LOG.debug("Received stop backup request.")
 
     def drive_backup(self, uuid, disk=None, targetdir=None,
                      format="qcow2", interval=10):
@@ -217,7 +220,23 @@ class LibvirtDriver(object):
         return "OK"
 
     def stop_backup(self, uuid, disk=None):
-        pass
+        if uuid not in self.timers:
+            raise exception.InstanceNotInBackup(uuid=uuid)
+
+        if disk and disk not in self.timers[uuid]:
+            raise exception.DiskNotInBackup(uuid=uuid,
+                                            disk=disk)
+
+        # If disk is None, stop all the disk timers of the instance
+        if disk is None:
+            for timer in self.timers[uuid].items():
+                timer.stop()
+        else:
+            # Send an event to the timer to stop backup looping call
+            timer = self.timers[uuid][disk]
+            timer.stop()
+
+        return "OK"
 
     def drive_restore(self, uuid, timestamp, disk=None):
         pass

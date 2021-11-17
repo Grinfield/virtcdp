@@ -44,7 +44,12 @@ class BackupConductor(object):
 
     def stop_backup(self, uuid):
         # stop backup task
-        pass
+        uuid = 'e50874d7-3cb8-4b51-aba2-a76ab270d656'
+        disk = "drive-ide0-0-0"
+
+        LOG.debug("Going to stop backup %s", uuid)
+        ret = self.driver.stop_backup(uuid, disk)
+        return ret
 
     def restore(self, *args, **kwargs):
         # restore from backup data

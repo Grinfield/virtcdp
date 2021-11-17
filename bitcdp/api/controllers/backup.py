@@ -12,7 +12,6 @@ class BackupController(BaseController):
     @expose('json')
     def index(self):
         rst = self.call('backup', 'instanceA', 'disk1')
-        print 'rst: %s' % rst
         dom1 = {'instance1': {'disk': rst}}
         return dom1
 
@@ -21,3 +20,8 @@ class BackupController(BaseController):
     # 查看所有备份任务
 
     # 停止备份任务
+    @expose('json')
+    def stop(self):
+        result = self.call("stop_backup", "uuid")
+        ret = {"uuid": result}
+        return ret
