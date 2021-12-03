@@ -1,8 +1,9 @@
 
-logging>=0.4.9.5 # 0.4.9.6
+# logging>=0.4.9.5 # 0.4.9.6
 oslo.config>=6.1.0 # 7.0.0
 pecan>=1.0.0 # 1.4.0
 Werkzeug>=0.9 #1.0.1
 eventlet!=0.18.3,>=0.18.2 # MIT
 lxml!=3.7.0,>=2.3 # BSD
 oslo.utils>=3.18.0 # Apache-2.0
+oslo.concurrency>=3.8.0

@@ -35,5 +35,5 @@ instances
 keeper
 keys
 MANIFEST
-etc/bitcdp.conf
+etc/virtcdp.conf
 pecan_test_project
