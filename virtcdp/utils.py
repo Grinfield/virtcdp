@@ -20,12 +20,6 @@ def spawn(func, *args, **kwargs):
 
     @functools.wraps(func)
     def context_wrapper(*args, **kwargs):
-        # NOTE: If update_store is not called after spawn it won't be
-        # available for the logger to pull from threadlocal storage.
-        # if _context is not None:
-        #     _context.update_store()
-        # if profiler_info and profiler:
-        #     profiler.init(**profiler_info)
         return func(*args, **kwargs)
 
     return eventlet.spawn(context_wrapper, *args, **kwargs)
@@ -43,8 +37,6 @@ def spawn_n(func, *args, **kwargs):
     """
     @functools.wraps(func)
     def context_wrapper(*args, **kwargs):
-        # NOTE: If update_store is not called after spawn_n it won't be
-        # available for the logger to pull from threadlocal storage.
         func(*args, **kwargs)
 
     eventlet.spawn_n(context_wrapper, *args, **kwargs)
@@ -115,13 +107,14 @@ def get_pci_address(domain, bus, slot, func):
 
 
 def convert_datetime_to_ts(dt_str):
+    if not dt_str:
+        return
     dt = timeutils.normalize_time(timeutils.parse_isotime(dt_str))
     if six.PY2:
         time_obj = dt.timetuple()
         ts = time.mktime(time_obj)
     else:
         ts = dt.timestamp()
-
     return ts
 
 

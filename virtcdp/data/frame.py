@@ -109,26 +109,21 @@ class FrameHandler(object):
         writer.write(metadata)
         writer.write(self.types.TERM)
 
-    def write_data(self, writer, reader, ext):
+    def write_data(self, writer, client, ext, connection):
         self._write_frame(writer, self.types.DATA, ext.offset, ext.length)
 
         LOG.debug("Read data from: start %s, length: %s",
                   ext.offset, ext.length)
+        if ext.length > client.max_req_size:
+            LOG.debug("Chunked data read from: start %s, length: %s.",
+                      ext.offset, ext.length)
+            w_size = self.chunk_write(writer, ext.offset, ext.length,
+                                      client, connection)
+        else:
+            w_size = self.direct_write(writer, ext.offset, ext.length,
+                                       connection)
 
-        rest = ext.length
-        read = 0
-        while rest != 0:
-            pos = ext.length + read
-            reader.seek(pos)
-            data = reader.read(rest)
-            LOG.debug("==>[backup] read data: %d", len(data))
-
-            rest -= len(data)
-            read += len(data)
-
-            writer.write(data)
-
-        assert read == ext.length
+        assert w_size == ext.length
         writer.write(self.types.TERM)
 
     def write_zero(self, writer, ext):
@@ -157,57 +152,86 @@ class FrameHandler(object):
         # LOG.debug("==> read term: %s", binascii.b2a_hex(term))
         assert reader.read(len(self.types.TERM)) == self.types.TERM
 
-    def read_all(self, meta, reader, writer):
-        dataSize = 0
+    def read_all(self, meta, reader, client, connection):
+        data_size = 0
         while True:
             try:
                 kind, start, length = self._read_frame(reader)
-                LOG.debug("==> kind:%s, start:%016X, length:%016X", kind, start, length)
-            except Exception as e:
-                LOG.exception("Wrong stream at pos: %s", reader.tell())
+            except Exception:
+                LOG.error("Wrong stream at pos: %s", reader.tell())
                 raise
 
             if kind == self.types.ZERO:
                 LOG.debug("Write zero segment from %s length: %s", start, length)
-                # connection.zero(length, start)
+                connection.zero(length, start)
                 # writer.seek(start)
-                # writer.write("".zfill(length))
 
             elif kind == self.types.DATA:
                 LOG.debug("Process data segment from %s length: %s", start, length)
-                # LOG.debug("==> Read at addr: %s", reader.tell())
-                originalSize = length
+                original_size = length
 
-                try:
-                    # connection.pwrite(data, start)
-                    writer.seek(start)
-
-                    rest = length
-                    read = 0
-                    while rest != 0:
-                        # pos = length + read
-                        # reader.seek(pos)
-                        data = reader.read(rest)
-                        LOG.debug("==>[restore] read data: %d", len(data))
-
-                        rest -= len(data)
-                        read += len(data)
-
-                        writer.write(data)
-                except Exception as e:
-                    LOG.exception(e)
-                    return False
+                if length > client.max_req_size:
+                    LOG.debug("Chunked read/write, start: %s, len: %s", start, length)
+                    read = self.chunk_read(reader, start, length, client, connection)
+                else:
+                    read = self.direct_read(reader, start, length, connection)
 
                 assert read == length
                 self.test(reader)
-                dataSize += originalSize
+                data_size += original_size
 
             elif kind == self.types.STOP:
-                if dataSize == meta["dataSize"]:
-                    LOG.info("End of stream, %s bytes of data processed.", dataSize)
+                if data_size == meta["dataSize"]:
+                    LOG.info("End of stream, %s bytes of data processed.", data_size)
                     return True
 
                 LOG.error("Error: restored data size %s != %s",
-                          dataSize,
-                          meta["dataSize"])
+                          data_size, meta["dataSize"])
                 return False
+
+    def chunk_write(self, writer, offset, length, client, nbd_conn):
+        """During extent processing, consecutive blocks with
+        the same type(data or zeroed) are unified into one big chunk.
+        This helps to reduce requests to the NBD Server.
+
+        But in cases where the block to be saved exceeds the maximum
+        recommended request size (nbdClient.maxRequestSize), we
+        need to split one big request into multiple not exceeding
+        the limit
+        """
+        w_size = 0
+        for blocklen, block_offset in client.block_step(offset, length,
+                                                        client.max_req_size):
+            data = nbd_conn.pread(blocklen, block_offset)
+            w_size += writer.write(data)
+
+        return w_size
+
+    def direct_write(self, writer, offset, length, nbd_conn):
+        data = nbd_conn.pread(length, offset)
+        return writer.write(data)
+
+    def chunk_read(self, reader, offset, length, client, nbd_conn):
+        """Read data from reader and write to nbd connection
+
+        Frames are read from the stream at the compressed size information
+        (offset in the stream).
+
+        If no compression is enabled, data is read from the regular
+        data header at its position and written to nbd target
+        directly.
+        """
+        w_size = 0
+        for blocklen, block_offset in client.block_step(offset, length,
+                                                        client.max_req_size):
+            data = reader.read(blocklen)
+            nbd_conn.pwrite(data, block_offset)
+            w_size += len(data)
+
+        return w_size
+
+    def direct_read(self, reader, offset, length, connection):
+        data = reader.read(length)
+        connection.pwrite(data, offset)
+        written = len(data)
+        return written

@@ -332,7 +332,7 @@ class Guest(object):
 
         try:
             with self.wait_qemu_monitor_event(
-                    timeout=30, match="BLOCK_JOB_COMPLETED") as event:
+                    timeout=600, match="BLOCK_JOB_COMPLETED") as event:
                 LOG.debug("Received full backup COMPLETED event "
                           "from domain, %s", event)
         except Exception as e:

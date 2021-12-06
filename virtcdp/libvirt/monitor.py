@@ -46,7 +46,6 @@ class QemuMonitor(object):
             result = qemuMonitorCommand(self._domain,
                                         QMPCmd.makecmd(cmd, cmdid, **kwargs),
                                         flags=libvirt_qemu.VIR_DOMAIN_QEMU_MONITOR_COMMAND_DEFAULT)
-            print("<<<- Get result: %s." % result)
             LOG.debug("<<<- Get result: %s.", result)
 
             if isinstance(result, str):
@@ -98,7 +97,7 @@ class QemuMonitor(object):
 
     def full_backup_with_bitmap(self, dev, target, format="qcow2", sync="full"):
         actions = []
-        bitmap = "bitcdp-%s" % dev.node
+        bitmap = "virtcdp-%s" % dev.node
         if dev.has_bitmap:
             actions.append(self.transaction_bitmap_clear(dev.node, bitmap))
         else:
@@ -116,7 +115,7 @@ class QemuMonitor(object):
         return reply
 
     def inc_backup(self, dev, target, format="qcow2", sync="incremental"):
-        bitmap = "bitcdp-%s" % dev.node
+        bitmap = "virtcdp-%s" % dev.node
         if not dev.has_bitmap:
             raise exception.IncBackupNoBitmapException(
                 dev=dev.node,
@@ -147,15 +146,7 @@ class QemuMonitor(object):
                 else:
                     continue
 
-            # state = False
-            if dev.has_bitmap is True:
-                state = self._check_bitmap_state(dev.node, dev.bitmaps)
-                if state is not True:
-                    LOG.warning("Bitmap for device %(device)s is in state %(state)s.",
-                                {"device": dev.node,
-                                 "state": state})
-            # if state is False:
-            #     dev.has_bitmap = False
+            self._check_bitmap_state(dev)
 
         return rst
 
@@ -164,47 +155,54 @@ class QemuMonitor(object):
         return self._get_block_devices(ret)
 
     @staticmethod
-    def _check_bitmap_state(node, bitmaps):
+    def _check_bitmap_state(device):
         """
         Check if the bitmap state is ready for backup
             active  -> Ready for backup
             frozen  -> backup in progress
             disabled-> migration might be going on
         """
-        for bitmap in bitmaps:
-            LOG.debug('Node %s, Bitmap: %s', node, bitmap)
-            match = "%s-%s" % ('bitcdp', node)
-            if bitmap["name"] == match and bitmap['status'] == "active":
-                return True
-            else:
-                return False
+        if device.has_bitmap:
+            bitmap = device.bitmap
+            state = bitmap['status'] == "active"
+            if state is not True:
+                LOG.error("Bitmap for device %(device)s is in state %(state)s.",
+                          {"device": device.node,
+                           "state": state})
+                raise exception.InvalidBitmapState(device=device.node,
+                                                   state=state)
+        return True
 
-    @staticmethod
-    def _get_block_devices(blockinfo):
+    def _get_block_devices(self, blockinfo):
         """Get a list of block devices that we can create a bitmap for,
            currently we only get inserted qcow based images
         """
         BlockDev = namedtuple('BlockDev', [
-            'node', 'format', 'filename', 'backing_image', 'has_bitmap', 'bitmaps'
+            'node', 'format', 'filename', 'backing_image', 'has_bitmap', 'bitmap'
         ])
         blockdevs = []
 
         for device in blockinfo:
+            # TODO: node may be "", need more code 
+            node = device['device']
             backing_image = False
             has_bitmap = False
-            bitmaps = None
+            bitmap = {}
 
             try:
                 inserted = device['inserted']
                 # if inserted['drv'] == 'raw':
                 #     continue
 
-                try:
-                    if len(device['dirty-bitmaps']) > 0:
-                        has_bitmap = True
-                        bitmaps = device['dirty-bitmaps']
-                except KeyError:
-                    pass
+                if device.get('dirty-bitmaps', None):
+                    bitmaps = device['dirty-bitmaps']
+                    for bm in bitmaps:
+                        LOG.debug('Node %s, Bitmap: %s', node, bm)
+                        match = "%s-%s" % ('virtcdp', node)
+                        if bm["name"] == match:
+                            bitmap = bm
+                            has_bitmap = True
+                            break
 
                 try:
                     bi = inserted['image']['backing-image']
@@ -213,12 +211,12 @@ class QemuMonitor(object):
                     pass
 
                 blockdevs.append(BlockDev(
-                    device['device'],
+                    node,
                     inserted['image']['format'],
                     inserted['image']['filename'],
                     backing_image,
                     has_bitmap,
-                    bitmaps)
+                    bitmap)
                 )
             except KeyError:
                 continue

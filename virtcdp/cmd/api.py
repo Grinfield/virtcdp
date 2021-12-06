@@ -1,7 +1,10 @@
 # Copyright Shenzhen Mulang Cloud Data Co.,Ltd
 # All Rights Reserved.
 
+import os
 import sys
+parent = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(parent)
 
 from virtcdp import service
 

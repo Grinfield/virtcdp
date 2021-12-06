@@ -8,10 +8,8 @@ from virtcdp.api import middleware
 def setup_app(pecan_config=None):
     app_hooks = [
         #               hooks.ConfigHook(conf),
-        hooks.SimpleHook(),
         hooks.RPCHook(),
-        #              hooks.NotifierHook(conf),
-        #              hooks.TranslationHook()
+        hooks.ExceptionHook(),
     ]
 
     pecan_config = pecan_config or {

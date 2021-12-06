@@ -25,9 +25,9 @@ class RPCApi(object):
         self._rpc_server = CONF.rpc_server_listen
         self._rpc_port = CONF.rpc_server_listen_port
         url = "http://%s:%s/" % (self._rpc_server, self._rpc_port)
-        self._proxy = client.ServerProxy(url)
+        self._proxy = client.ServerProxy(url, allow_none=True)
 
-    def call(self, method, *args, **kwargs):
+    def call(self, method, *args):
         # return self._client.call(self._context, method, *args, **kwargs)
         func = getattr(self._proxy, method)
-        return func(*args, **kwargs)
+        return func(*args)

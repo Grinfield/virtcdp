@@ -1,6 +1,25 @@
+import functools
 import logging
 
 LOG = logging.getLogger(__name__)
+
+
+def wrap_exception(reraise=True):
+    """This decorator wraps a method to catch any exceptions that may
+    get thrown.
+    """
+    def inner(f):
+        @functools.wraps(f)
+        def wrapped(self, *args, **kw):
+
+            try:
+                return f(self, *args, **kw)
+            except Exception as e:
+                LOG.exception('Original exception being dropped:')
+                if reraise:
+                    raise e
+        return wrapped
+    return inner
 
 
 class VirtcdpException(Exception):
@@ -87,9 +106,25 @@ class InvalidInput(Invalid):
     msg_fmt = "Invalid input received: %(reason)s"
 
 
+class InvalidParamValue(Invalid):
+    msg_fmt = "Invalid param %(param)s, value: %(value)s"
+
+
+class InvalidUUID(Invalid):
+    msg_fmt = "Expected a uuid but received %(uuid)s."
+
+
+class InvalidIntervalValue(Invalid):
+    msg_fmt = "Interval %(interval)s value should not < 1"
+
+
 class IncBackupNoBitmapException(Invalid):
     msg_fmt = "Device %(dev)s of instance %(uuid)s do incremental " \
               "backup without bitmap."
+
+
+class InvalidImageFormat(Invalid):
+    msg_fmt = "Image format is invalid, format: %(format)s"
 
 
 class InstanceNotInBackup(Invalid):
@@ -102,3 +137,7 @@ class DiskNotInBackup(Invalid):
 
 class NoFullImageException(Invalid):
     msg_fmt = "No full backup image found at the directory %(data_dir)s."
+
+
+class InvalidBitmapState(Invalid):
+    msg_fmt = "Bitmap for device %(device)s is in state %(state)s."

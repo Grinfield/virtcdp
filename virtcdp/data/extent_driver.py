@@ -2,17 +2,16 @@ import json
 import subprocess
 import logging
 
+from virtcdp import utils
+
 LOG = logging.getLogger(__name__)
 
 
-from virtcdp import utils
-
-
-class QemuDriver:
+class QemuDriver(object):
     """Wrapper for qemu executables"""
 
-    def __init__(self, exportName=None):
-        self.exportName = exportName
+    def __init__(self):
+        super(QemuDriver, self).__init__()
 
     def map(self, target):
         extent_map, err = utils.execute("qemu-img", "map",
@@ -31,18 +30,18 @@ class QemuDriver:
 
         return True
 
-    def start_nbd_server(self, targetFile, socketFile):
+    def start_nbd_server(self, export_name, target_file, socket_file):
         p = subprocess.Popen(
             [
                 "qemu-nbd",
                 "--discard=unmap",
                 "--format=qcow2",
                 "-x",
-                "{self.exportName}",
-                "{targetFile}",
+                f"{export_name}",
+                f"{target_file}",
                 "-k",
-                "{socketFile}",
-            ],
+                f"{socket_file}",
+            ]
         )
 
         return p.pid

@@ -3,14 +3,14 @@ import datetime
 import os
 import time
 import glob
+import nbd
 
-from oslo_utils import timeutils
 from oslo_concurrency import processutils
 
 from virtcdp.data import extent
 from virtcdp.data import frame
 from virtcdp.data import extent_driver
-# from virtcdp.data import nbd_driver
+from virtcdp.data import nbd_driver
 from virtcdp import exception
 
 LOG = logging.getLogger(__name__)
@@ -42,15 +42,25 @@ class ProcessFactory(object):
         LOG.debug("Target %s got %s extents, virtual size %s, thin size %s.",
                   target, len(exts), virt_size, thin_size)
 
+        no_dirty = False
         if sync == "incremental" and thin_size == 0:
             LOG.info("No dirty blocks found for backup %s.", target)
+            no_dirty = True
 
+        client, connection = None, None
         try:
             with open(target, "rb") as reader:
                 # new_file = self.create_dump_file(target, self.qemu_driver,
                 #                                  format, virt_size)
                 new_file = target + "@"
                 LOG.info("Write data to target file: %s", new_file)
+
+                # read data via qemu-nbd
+                if not no_dirty:
+                    sock_file = self.get_sock_file(action="backup")
+                    self.start_nbd_server(disk_name, target,
+                                          sock_file, self.qemu_driver)
+                    client, connection = self.connect_nbd_server(disk_name, sock_file)
 
                 with open(new_file, "wb") as writer:
                     metadata = {
@@ -65,11 +75,20 @@ class ProcessFactory(object):
                     LOG.debug("==> target: %s, metadata: %s", new_file, metadata)
 
                     self._write_header(writer, metadata)
-                    self._write_extents(writer, reader, sync, exts)
+                    self._write_extents(writer, client, sync, exts, connection)
                     self._write_endian(writer)
 
-        except IOError as e:
-            raise RuntimeError("Unable to open target file: {e}" % e)
+        except OSError as e:
+            LOG.error(f"IO error: {e}")
+            raise
+        except nbd.Error as e:
+            LOG.error(f"NBD handling error: {e.string}({e.errno})")
+            raise
+        except Exception as e:
+            raise e
+        finally:
+            if client:
+                client.disconnect()
 
         return True
 
@@ -79,7 +98,7 @@ class ProcessFactory(object):
                 self.qemu_driver.check(target)
             except processutils.ProcessExecutionError as e:
                 if e.exit_code == 3:
-                    LOG.warn("Checking image %s: image has leaked clusters.", target)
+                    LOG.warning("Checking image %s: image has leaked clusters.", target)
                     time.sleep(0.5)
                     continue
                 else:
@@ -88,7 +107,8 @@ class ProcessFactory(object):
             else:
                 break
 
-    def load_data(self, block, util_ts, data_dir, tgt_dir):
+    @exception.wrap_exception(reraise=False)
+    def load_data(self, block, util_ts, data_dir, restore_dir):
 
         # find the latest full-backup image and inc-backup images
         # followed until the util_ts to make a list, and then sort
@@ -96,7 +116,7 @@ class ProcessFactory(object):
         images = self._get_backup_images(data_dir, util_ts)
 
         if len(images) < 1:
-            LOG.warn("Didn't find any backup for disk image %s.", data_dir)
+            LOG.warning("Didn't find any backup for disk image %s.", data_dir)
             return False
 
         if "FULL" not in images[0]:
@@ -105,29 +125,37 @@ class ProcessFactory(object):
 
         meta = self.read_image_metadata(images[0])
 
-        # qFh = extent_driver.QemuDriver(meta["diskName"])
-
         target_file = self.create_restore_file(meta, self.qemu_driver,
-                                               block, tgt_dir)
+                                               block, restore_dir)
 
-        # sock_file = self.get_sock_file()
-        # self.start_nbd_server(target_file, sock_file, qFh)
-        # client, connection = self.connect_nbd_server(meta, sock_file)
+        sock_file = self.get_sock_file(action="restore")
+        self.start_nbd_server(meta["diskName"], target_file,
+                              sock_file, self.qemu_driver)
+        client, connection = self.connect_nbd_server(meta["diskName"], sock_file)
 
-        with open(target_file, "wb") as writer:
+        # with open(target_file, "wb") as writer:
+        #     for img in images:
+        #         self.read2write(img, target_file, writer)
+        try:
             for img in images:
-                self.read2write(img, target_file, writer)
+                self.read2write(img, target_file, client, connection)
+        finally:
+            client.disconnect()
 
     def _write_header(self, writer, metadata):
 
         self.frame_handler.write_meta(writer, metadata)
 
-    def _write_extents(self, writer, reader, sync, exts):
+    def _write_extents(self, writer, client, sync, exts, connection):
 
         for ext in exts:
             if ext.data:
-                self.frame_handler.write_data(writer, reader, ext)
-            # Note: only full backup, need we write zero frame to image
+                if not connection:
+                    LOG.error("Connection should not be None, it it initialized?")
+                    raise ValueError("Connection to NBD server is None,"
+                                     " while dirty block need be written through it.")
+                self.frame_handler.write_data(writer, client, ext, connection)
+            # Note: only when full backup, need we write zero frame to image
             if ext.zero and sync == "full":
                 self.frame_handler.write_zero(writer, ext)
 
@@ -135,11 +163,10 @@ class ProcessFactory(object):
         self.frame_handler.write_stop(writer)
 
     def create_restore_file(self, meta, qFh, disk, dir):
-        target_file = os.path.join(dir, disk.node + ".%s" % timeutils.isotime())
+        target_file = os.path.join(dir, disk.node + ".%s" % int(time.time()))
 
         LOG.info("Create virtual Disk [%s] format: [%s]",
-                 target_file,
-                 disk.format)
+                 target_file, disk.format)
         LOG.info("Virtual Size %s", meta["virtualSize"])
 
         try:
@@ -165,18 +192,18 @@ class ProcessFactory(object):
 
         return target_file
 
-    def start_nbd_server(self, target_file, sock_file, qFh):
+    def start_nbd_server(self, disk_name, target_file, sock_file, qFh):
         LOG.info("Starting nbd server on socket: %s", sock_file)
 
         try:
-            nbd_srv = qFh.start_nbd_server(target_file, sock_file)
+            nbd_srv = qFh.start_nbd_server(disk_name, target_file, sock_file)
             LOG.info("NBD Server PID: %s", nbd_srv)
         except Exception as e:
             logging.error("Unable to start nbd server: %s", e)
             raise RuntimeError("Unable to start nbd server")
 
-    def connect_nbd_server(self, meta, sock_file):
-        nbd_client = nbd_driver.NBDClient(meta["diskName"], None, sock_file)
+    def connect_nbd_server(self, disk_name, sock_file):
+        nbd_client = nbd_driver.NBDClient(disk_name, None, sock_file)
         LOG.info("Waiting until nbd server on socket %s is up.", sock_file)
         retry = 0
         max_retry = 20
@@ -198,9 +225,9 @@ class ProcessFactory(object):
         return nbd_client, connection
 
     @staticmethod
-    def get_sock_file(sock_path=None):
+    def get_sock_file(sock_path=None, action="backup"):
         if sock_path is None:
-            sock_file = "/var/tmp/virtcdp.{os.getpid()}"
+            sock_file = f"/var/tmp/virtcdp.{action}.{os.getpid()}"
         else:
             sock_file = sock_path
 
@@ -216,7 +243,7 @@ class ProcessFactory(object):
                 raise
         return meta
 
-    def read2write(self, data_file, target_file, writer):
+    def read2write(self, data_file, target_file, client, connection):
         """Restore data for disk"""
         reader = None
         try:
@@ -233,9 +260,12 @@ class ProcessFactory(object):
             self.frame_handler.test(reader)
 
             # Read data frame behind metadata frame util stop frame
-            self.frame_handler.read_all(meta, reader, writer)
-        except IOError as e:
-            LOG.exception("Error occurred in reading image %s: %s.", data_file, e)
+            self.frame_handler.read_all(meta, reader, client, connection)
+        except OSError as e:
+            LOG.error("Error occurred in reading image %s: %s.", data_file, e)
+            raise
+        except nbd.Error as e:
+            LOG.error(f"NBD handling error occurred: {e.string}({e.errno})")
             raise
         except Exception as e:
             LOG.error("Error occurred in restoring image: %s", e)

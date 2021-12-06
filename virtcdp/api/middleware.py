@@ -39,19 +39,15 @@ class ParsableErrorMiddleware(object):
 
         app_iter = self.app(environ, replacement_start_response)
         if (state['status_code'] // 100) not in (2, 3):
-            # req = webob.Request(environ)
-            error = environ.get('translatable_error')
             content_type = 'application/json'
             app_data = b'\n'.join(app_iter)
             if six.PY3:
                 app_data = app_data.decode('utf-8')
             try:
                 fault = json.loads(app_data)
-                if error is not None and 'faultstring' in fault:
-                    fault['faultstring'] = error
             except ValueError as err:
-                fault = app_data
-            body = json.dumps({'error_message': fault})
+                fault = {'error_message': app_data}
+            body = json.dumps(fault)
             if six.PY3:
                 body = body.encode('utf-8')
 

@@ -190,8 +190,7 @@ class LibvirtDriver(object):
     def drive_backup(self, uuid, disk=None, targetdir=None,
                      format="qcow2", interval=10):
         if targetdir is None:
-            raise ValueError("Target directory of backup shouldn't be NULL.")
-        LOG.info("Starting backup for instance %s...", uuid)
+            raise exception.Invalid("Target directory of backup shouldn't be NULL.")
 
         kwargs = {}
         wrapped_conn = connection.LibvirtConnection()
@@ -212,12 +211,13 @@ class LibvirtDriver(object):
                                       *args, **kwargs):
             try:
                 self._do_instance_backup(guest, *args, **kwargs)
-            except Exception as ex:
-                LOG.exception("Error occurred during backup: %s", ex)
-                raise ex
+            except Exception:
+                LOG.exception("Error occurred during backup: ")
             finally:
                 finalize_func()
 
+        # Start a new co-routine to do backup for the instance,
+        # since what follows could take a really long time.
         utils.spawn_n(_inner_do_instance_backup,
                       guest_obj,
                       _finalize_task,
@@ -238,7 +238,7 @@ class LibvirtDriver(object):
 
         # If disk is None, stop all the disk timers of the instance
         if disk is None:
-            for timer in self.timers[uuid].items():
+            for timer in six.itervalues(self.timers[uuid]):
                 if not isinstance(timer, loopingcall.LoopingCallBase):
                     continue
                 timer.stop()
@@ -284,13 +284,14 @@ class LibvirtDriver(object):
             if not os.path.exists(disk_restore_dir):
                 os.makedirs(disk_restore_dir)
 
-            LOG.info("Begin to restore data from %(data_dir)s to %(tgt_dir)s"
+            LOG.info("Begin to restore data from %(data_dir)s to %(restore_dir)s"
                      " for block %(block)s of instance %(uuid)s.",
                      {"data_dir": disk_data_dir,
-                      "tgt_dir": disk_restore_dir,
+                      "restore_dir": disk_restore_dir,
                       "block": blk.node,
                       "uuid": uuid})
-            # Start a new co-routine to restore data for each block device.
+            # Start a new co-routine to restore data for each block device,
+            # since what follows could take a really long time.
             utils.spawn_n(self.data_processor.load_data,
                           blk,
                           util_ts,

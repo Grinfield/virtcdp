@@ -10,7 +10,7 @@ class RootController(object):
     backup = bkp.BackupController()
     restore = rst.RestoreController()
 
-    @expose('json')
+    @expose(template='json')
     def index(self):
         base_url = request.application_url
         versions = {'versions': {'values': base_url}}

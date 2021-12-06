@@ -145,10 +145,7 @@ class LibvirtConnection(object):
     def get_domain(self, uuid):
         """Retrieve libvirt domain object for an instance.
 
-        All libvirt error handling should be handled in this method and
-        relevant nova exceptions should be raised in response.
-
-        :param instance: a nova.objects.Instance object
+        :param uuid: a libvirt domain uuid
 
         :returns: a libvirt.Domain object
         :raises exception.InstanceNotFound: The domain was not found

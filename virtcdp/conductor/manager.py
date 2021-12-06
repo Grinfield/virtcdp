@@ -10,7 +10,6 @@ else:
 
 from virtcdp import exception
 from virtcdp.libvirt import driver
-from virtcdp import utils
 
 
 LOG = logging.getLogger(__name__)
@@ -36,39 +35,34 @@ class BackupConductor(object):
         return list_public_methods(self) + \
                ['string.' + method for method in list_public_methods(self.string)]
 
-    def backup(self, uuid, *args):
-        # name = 'cirros_test1'
-        uuid = 'e50874d7-3cb8-4b51-aba2-a76ab270d656'
-        targetdir = "/tmp/backup/"
-        format = "qcow2"
-        interval = 10
-
-        kwargs = {"targetdir": targetdir,
-                  "format": format,
-                  "disk": None,
-                  "interval": interval}
-        ret = self.driver.drive_backup(uuid, **kwargs)
+    @exception.wrap_exception()
+    def start_backup(self, uuid, kwargs):
+        """start backup task"""
+        kw = {"targetdir": kwargs.get("target_dir"),
+              "format": kwargs.get("format"),
+              "disk": kwargs.get("disk"),
+              "interval": kwargs.get("interval")}
+        LOG.info("Starting backup for instance %s...", uuid)
+        ret = self.driver.drive_backup(uuid, **kw)
         return ret
 
-    def stop_backup(self, uuid):
+    @exception.wrap_exception()
+    def stop_backup(self, uuid, disk):
         """stop backup task"""
-
-        uuid = 'e50874d7-3cb8-4b51-aba2-a76ab270d656'
-        disk = "drive-ide0-0-0"
 
         LOG.debug("Going to stop backup %s", uuid)
         ret = self.driver.stop_backup(uuid, disk)
         return ret
 
-    def restore(self, *args, **kwargs):
+    @exception.wrap_exception()
+    def restore(self, uuid, kwargs):
         """restore from backup data"""
-
-        uuid = 'e50874d7-3cb8-4b51-aba2-a76ab270d656'
         # TODO: disk should change to 'vda, vdb...
-        disk = "drive-ide0-0-0"
-        data_dir = "/tmp/backup/"
-        dt_str = "2021-12-03T17:45:08+0800"
-        restore_dir = "/tmp/restore/"
+        disk = kwargs.get("disk")
+        data_dir = kwargs.get("data_dir")
+        # date time format: "2021-12-05T17:45:08+0800"
+        util_ts = kwargs.get("util")
+        restore_dir = kwargs.get("restore_dir")
 
         if not os.path.exists(data_dir):
             LOG.error("Data directory input '%s' does not exist,"
@@ -82,12 +76,11 @@ class BackupConductor(object):
             raise exception.InvalidInput(
                 reason="Restore directory %s doesn't exist." % restore_dir)
 
-        util_ts = utils.convert_datetime_to_ts(dt_str)
-
         LOG.debug("Going to restore image from backed data.")
         try:
             ret = self.driver.drive_restore(uuid, data_dir, util_ts,
-                                            disk=disk, restore_dir=restore_dir)
+                                            disk=disk,
+                                            restore_dir=restore_dir)
         except Exception as e:
             LOG.error("Failed to restore: %s.", e)
             raise e

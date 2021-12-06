@@ -48,7 +48,8 @@ class RPCService(object):
         self._server = None
 
     def start(self, workers=1):
-        self._server = SimpleXMLRPCServer((self.host, self.port))
+        self._server = SimpleXMLRPCServer((self.host, self.port),
+                                          allow_none=True)
         self._server.register_introspection_functions()
         for e in self.endpoints:
             self._server.register_instance(e)
