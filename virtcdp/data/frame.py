@@ -115,7 +115,7 @@ class FrameHandler(object):
         LOG.debug("Read data from: start %s, length: %s",
                   ext.offset, ext.length)
         if ext.length > client.max_req_size:
-            LOG.debug("Chunked data read from: start %s, length: %s.",
+            LOG.debug("Chunked data read from: start %s, length: %s",
                       ext.offset, ext.length)
             w_size = self.chunk_write(writer, ext.offset, ext.length,
                                       client, connection)

@@ -20,11 +20,16 @@ class RestoreController(BaseController):
         # date time format: "2021-12-05T17:45:08+0800"
         dt_str = kwargs.get("datetime")
         restore_dir = kwargs.get("restore_dir")
+        format = kwargs.get("format", "qcow2")
+
         if uuid is None:
             raise exception.InvalidUUID(uuid=uuid)
         if data_dir is None:
             raise exception.InvalidParamValue(param="target_dir",
                                               value=data_dir)
+        if format not in ["qcow2", "raw"]:
+            raise exception.InvalidParamValue(param="format",
+                                              value=format)
 
         util_ts = None
         try:
@@ -39,7 +44,8 @@ class RestoreController(BaseController):
             "data_dir": data_dir,
             "util": util_ts,
             "restore_dir": restore_dir,
-            "disk": disk
+            "disk": disk,
+            "format": format
         }
         rst = self.call('restore', uuid, kw)
         return rst

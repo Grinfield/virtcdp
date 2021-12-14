@@ -5,7 +5,7 @@ import six
 LOG = logging.getLogger(__name__)
 
 
-class Extent:
+class Extent(object):
     def __init__(self):
         self.data = False
         self.zero = False
@@ -33,7 +33,7 @@ class ExtentHandler(object):
             ext.zero = bool(extent["zero"])
             ext.offset = extent["start"]
             ext.length = extent["length"]
-            LOG.debug("Got ext: %s.", six.text_type(ext))
+            LOG.debug("Got ext: %s", six.text_type(ext))
 
             extents.append(ext)
 

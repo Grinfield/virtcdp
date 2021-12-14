@@ -6,6 +6,7 @@ import glob
 import nbd
 
 from oslo_concurrency import processutils
+from oslo_utils import timeutils
 
 from virtcdp.data import extent
 from virtcdp.data import frame
@@ -108,8 +109,16 @@ class ProcessFactory(object):
                 break
 
     @exception.wrap_exception(reraise=False)
-    def load_data(self, block, util_ts, data_dir, restore_dir):
+    def load_data(self, uuid, block, format, util_ts, data_dir, restore_dir):
+        """Run this function in a co-routine, fulfilling image restoring."""
+        with timeutils.StopWatch() as sw:
+            self._do_load_data(block, format, util_ts, data_dir, restore_dir)
+            LOG.info('Took %0.2f seconds to restore image for %s.',
+                     sw.elapsed(), uuid)
 
+    def _do_load_data(self, block, format, util_ts, data_dir, restore_dir):
+        # we only support qcow2 temporarily
+        format = "qcow2"
         # find the latest full-backup image and inc-backup images
         # followed until the util_ts to make a list, and then sort
         # these images by created timestamp each.
@@ -126,7 +135,9 @@ class ProcessFactory(object):
         meta = self.read_image_metadata(images[0])
 
         target_file = self.create_restore_file(meta, self.qemu_driver,
-                                               block, restore_dir)
+                                               block,
+                                               format if format else block.format,
+                                               restore_dir)
 
         sock_file = self.get_sock_file(action="restore")
         self.start_nbd_server(meta["diskName"], target_file,
@@ -162,15 +173,15 @@ class ProcessFactory(object):
     def _write_endian(self, writer):
         self.frame_handler.write_stop(writer)
 
-    def create_restore_file(self, meta, qFh, disk, dir):
+    def create_restore_file(self, meta, qFh, disk, format, dir):
         target_file = os.path.join(dir, disk.node + ".%s" % int(time.time()))
 
         LOG.info("Create virtual Disk [%s] format: [%s]",
-                 target_file, disk.format)
+                 target_file, format)
         LOG.info("Virtual Size %s", meta["virtualSize"])
 
         try:
-            qFh.create(target_file, meta["virtualSize"], disk.format)
+            qFh.create(target_file, meta["virtualSize"], format)
         except Exception as e:
             LOG.error("Can't create restore image: %s", e)
             raise e

@@ -7,7 +7,7 @@ from virtcdp.api import middleware
 
 def setup_app(pecan_config=None):
     app_hooks = [
-        #               hooks.ConfigHook(conf),
+        # hooks.ConfigHook(conf),
         hooks.RPCHook(),
         hooks.ExceptionHook(),
     ]

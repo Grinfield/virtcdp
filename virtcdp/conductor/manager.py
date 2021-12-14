@@ -63,6 +63,7 @@ class BackupConductor(object):
         # date time format: "2021-12-05T17:45:08+0800"
         util_ts = kwargs.get("util")
         restore_dir = kwargs.get("restore_dir")
+        format = kwargs.get("format")
 
         if not os.path.exists(data_dir):
             LOG.error("Data directory input '%s' does not exist,"
@@ -78,7 +79,9 @@ class BackupConductor(object):
 
         LOG.debug("Going to restore image from backed data.")
         try:
-            ret = self.driver.drive_restore(uuid, data_dir, util_ts,
+            ret = self.driver.drive_restore(uuid, data_dir,
+                                            format=format,
+                                            util_ts=util_ts,
                                             disk=disk,
                                             restore_dir=restore_dir)
         except Exception as e:

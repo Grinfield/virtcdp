@@ -107,7 +107,7 @@ class InvalidInput(Invalid):
 
 
 class InvalidParamValue(Invalid):
-    msg_fmt = "Invalid param %(param)s, value: %(value)s"
+    msg_fmt = "Invalid param '%(param)s', value: %(value)s"
 
 
 class InvalidUUID(Invalid):

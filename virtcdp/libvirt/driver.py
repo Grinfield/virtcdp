@@ -6,6 +6,7 @@ import os
 
 from eventlet import patcher
 from oslo_config import cfg
+from oslo_utils import timeutils
 
 from virtcdp import exception
 from virtcdp.common import loopingcall
@@ -170,12 +171,15 @@ class LibvirtDriver(object):
                 os.makedirs(os.path.dirname(target))
 
             # do a full backup with dirty bitmap
-            guest.qmp_full_backup_with_bitmap(dev, target,
-                                              format=format,
-                                              sync="full")
-            self.data_processor.post_image_handle(dev.node, target,
+            with timeutils.StopWatch() as sw:
+                guest.qmp_full_backup_with_bitmap(dev, target,
                                                   format=format,
                                                   sync="full")
+                self.data_processor.post_image_handle(dev.node, target,
+                                                      format=format,
+                                                      sync="full")
+                LOG.info('Took %0.2f seconds to do full backup for %s.',
+                         sw.elapsed(), guest.uuid)
 
             # Create a looping call to do periodic incremental backup
             timer = loopingcall.FixedIntervalLoopingCall(_inc_backup,
@@ -250,8 +254,8 @@ class LibvirtDriver(object):
 
         return "OK"
 
-    def drive_restore(self, uuid, data_dir, util_ts=None,
-                      disk=None, restore_dir=None):
+    def drive_restore(self, uuid, data_dir, format="qcow2",
+                      util_ts=None, disk=None, restore_dir=None):
         if restore_dir is None:
             restore_dir = "~"
         # If tgt_ts is not designated, it means restore to the latest
@@ -293,7 +297,9 @@ class LibvirtDriver(object):
             # Start a new co-routine to restore data for each block device,
             # since what follows could take a really long time.
             utils.spawn_n(self.data_processor.load_data,
+                          uuid,
                           blk,
+                          format,
                           util_ts,
                           disk_data_dir,
                           disk_restore_dir)
