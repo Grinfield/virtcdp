@@ -49,34 +49,34 @@ class ProcessFactory(object):
 
         client, connection = None, None
         try:
-            with open(target, "rb") as reader:
-                # new_file = self.create_dump_file(target, self.qemu_driver,
-                #                                  format, virt_size)
-                new_file = target + "@"
-                LOG.info("Write data to target file: %s", new_file)
+            new_file = target + "@"
+            LOG.info("Write data to target file: %s", new_file)
 
-                # read data via qemu-nbd
-                if not no_dirty:
-                    sock_file = self.get_sock_file(action="backup")
-                    self.start_nbd_server(disk_name, target,
-                                          sock_file, self.qemu_driver)
-                    client, connection = self.connect_nbd_server(disk_name, sock_file)
+            # read data via qemu-nbd
+            if not no_dirty:
+                sock_file = self.get_sock_file(action="backup")
+                self.start_nbd_server(disk_name, target,
+                                      sock_file, self.qemu_driver)
+                client, connection = self.connect_nbd_server(disk_name, sock_file)
 
-                with open(new_file, "wb") as writer:
-                    metadata = {
-                        "virtualSize": virt_size,
-                        "dataSize": thin_size,
-                        "date": datetime.datetime.now().isoformat(),
-                        "diskName": disk_name,
-                        "compressed": compressed,
-                        "compressionMethod": compressed_method,
-                        "incremental": sync == "incremental",
-                    }
-                    LOG.debug("==> target: %s, metadata: %s", new_file, metadata)
+            with open(new_file, "wb") as writer:
+                metadata = {
+                    "virtualSize": virt_size,
+                    "dataSize": thin_size,
+                    "date": datetime.datetime.now().isoformat(),
+                    "diskName": disk_name,
+                    "compressed": compressed,
+                    "compressionMethod": compressed_method,
+                    "incremental": sync == "incremental",
+                }
+                LOG.debug("==> target: %s, metadata: %s", new_file, metadata)
 
-                    self._write_header(writer, metadata)
-                    self._write_extents(writer, client, sync, exts, connection)
-                    self._write_endian(writer)
+                self._write_header(writer, metadata)
+                self._write_extents(writer, client, sync, exts, connection)
+                self._write_endian(writer)
+
+            # unlink the original backup file
+            os.remove(target)
 
         except OSError as e:
             LOG.error(f"IO error: {e}")

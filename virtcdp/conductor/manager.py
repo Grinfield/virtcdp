@@ -56,7 +56,7 @@ class BackupConductor(object):
 
     @exception.wrap_exception()
     def restore(self, uuid, kwargs):
-        """restore from backup data"""
+        """Restore image from backup data"""
         # TODO: disk should change to 'vda, vdb...
         disk = kwargs.get("disk")
         data_dir = kwargs.get("data_dir")
