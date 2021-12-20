@@ -260,9 +260,10 @@ class Guest(object):
                 self._event_queue
             )
         except Exception as e:
-            LOG.warning("URI %(uri)s does not support qemu monitor"
-                        " events: %(error)s",
-                        {'uri': conn.getURI(), 'error': e})
+            LOG.error("URI %(uri)s does not support qemu monitor"
+                      " events: %(error)s",
+                      {'uri': conn.getURI(), 'error': e})
+            raise
 
         return id
 
@@ -349,7 +350,7 @@ class Guest(object):
         if new_dev is not None:
             dev = new_dev
         else:
-            LOG.warn("Pending block %s disappeared before doing backup.", dev.node)
+            LOG.warning("Pending block %s disappeared before doing backup.", dev.node)
             return False
 
         LOG.debug("Begin to do incremental backup for instance %(domain)s "
@@ -358,7 +359,7 @@ class Guest(object):
         self._qemu_mon.inc_backup(dev, target, format, sync)
 
         with self.wait_qemu_monitor_event(
-                timeout=30, match="BLOCK_JOB_COMPLETED") as event:
+                timeout=600, match="BLOCK_JOB_COMPLETED") as event:
             LOG.debug("Received inc backup COMPLETED event from domain, %s", event)
 
 

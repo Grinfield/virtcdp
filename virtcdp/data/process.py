@@ -13,6 +13,7 @@ from virtcdp.data import frame
 from virtcdp.data import extent_driver
 from virtcdp.data import nbd_driver
 from virtcdp import exception
+from virtcdp import utils
 
 LOG = logging.getLogger(__name__)
 
@@ -40,8 +41,10 @@ class ProcessFactory(object):
         exts = self.extent_handler.query_extents(target)
         virt_size = self.extent_handler.get_size(target).get("virtual-size")
         thin_size = sum([ext.length for ext in exts if ext.data is True])
-        LOG.debug("Target %s got %s extents, virtual size %s, thin size %s.",
-                  target, len(exts), virt_size, thin_size)
+        LOG.debug("Target %s got %d extents, virtual size %d(%.2fM),"
+                  " thin size %d(%.2fM)",
+                  target, len(exts), virt_size, virt_size/utils.UNITS.Mi,
+                  thin_size, thin_size/utils.UNITS.Mi)
 
         no_dirty = False
         if sync == "incremental" and thin_size == 0:
@@ -100,6 +103,11 @@ class ProcessFactory(object):
             except processutils.ProcessExecutionError as e:
                 if e.exit_code == 3:
                     LOG.warning("Checking image %s: image has leaked clusters.", target)
+                    time.sleep(0.5)
+                    continue
+                elif e.exit_code == 1 and \
+                        'Failed to get shared \"write\" lock' in e.stderr:
+                    LOG.warning("Qemu still hold write lock, wait util it releases.")
                     time.sleep(0.5)
                     continue
                 else:
