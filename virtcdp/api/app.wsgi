@@ -1,3 +1,8 @@
+"""
+Startup the application following by an uWSGI server
+eg: uwsgi --http :8663 --wsgi-file app.wsgi -p 4
+"""
+
 
 import sys
 
