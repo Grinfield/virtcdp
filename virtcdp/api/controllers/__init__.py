@@ -4,5 +4,5 @@ from pecan import request
 
 class BaseController(object):
     @staticmethod
-    def call(method, *args):
+    def rpccall(method, *args):
         return request.rpcapi.call(method, *args)

@@ -36,7 +36,7 @@ class BackupController(BaseController):
                   "format": format,
                   "disk": disk,
                   "interval": interval}
-        rst = self.call('start_backup', uuid, kwargs)
+        rst = self.rpccall('start_backup', uuid, kwargs)
         return rst
 
     # 查看备份任务
@@ -56,5 +56,5 @@ class BackupController(BaseController):
         if uuid is None:
             raise exception.InvalidUUID(uuid=uuid)
 
-        result = self.call("stop_backup", uuid, disk)
+        result = self.rpccall("stop_backup", uuid, disk)
         return result

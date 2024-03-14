@@ -47,7 +47,7 @@ class RestoreController(BaseController):
             "disk": disk,
             "format": format
         }
-        rst = self.call('restore', uuid, kw)
+        rst = self.rpccall('restore', uuid, kw)
         return rst
 
     # 停止恢复任务
