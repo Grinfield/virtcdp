@@ -129,7 +129,7 @@ class ProcessFactory(object):
         format = "qcow2"
         # find the latest full-backup image and inc-backup images
         # followed until the util_ts to make a list, and then sort
-        # these images by created timestamp each.
+        # these images by each created timestamp.
         images = self._get_backup_images(data_dir, util_ts)
 
         if len(images) < 1:
@@ -170,7 +170,7 @@ class ProcessFactory(object):
         for ext in exts:
             if ext.data:
                 if not connection:
-                    LOG.error("Connection should not be None, it it initialized?")
+                    LOG.error("Connection should not be None, is it initialized?")
                     raise ValueError("Connection to NBD server is None,"
                                      " while dirty block need be written through it.")
                 self.frame_handler.write_data(writer, client, ext, connection)
